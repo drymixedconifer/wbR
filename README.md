@@ -1,226 +1,211 @@
-[README.md](https://github.com/user-attachments/files/33631984/README.md)
-# wbR 1.0.0
+# wbR
 
-**Spatial water and energy balance modeling in R**
+### Spatial water and energy balance modeling in R
 
-wbR is a landscape-scale water-balance model for examining geographic and temporal variation in water availability and evaporative demand. It combines monthly climate inputs with topography, solar radiation, and soil water-storage capacity to estimate actual evapotranspiration (AET), climatic water deficit (CWD), potential evapotranspiration (PET), snow accumulation and melt, soil-water storage, and excess water (runoff). The model is designed for spatially explicit ecological and watershed analyses, from individual study areas to larger regions where computational resources permit.
+**Where water falls, where it goes, and where it falls short.**
+
+`wbR` estimates the climatic water balance of landscapes through time. It combines monthly climate data with elevation, terrain radiation, and soil water-storage capacity to model the movement of water through snowpack and soil, actual evapotranspiration (AET), and climatic water deficit (CWD). The result is a spatially explicit account of how water supply and atmospheric demand interact across complex terrain.
+
+Developed for landscape ecology, forest science, and watershed research, `wbR` supports analyses ranging from individual watersheds to regions of the western United States. Its outputs can be used to explore hydroclimatic change, ecological drought, forest responses, and geographic differences in water availability.
 
 **Authors:** James Johnston (University of Oregon) and Andreas Wion (New Mexico Forest and Watershed Restoration Institute)  
-**Source:** [github.com/drymixedconifer/wbR](https://github.com/drymixedconifer/wbR) · **License:** MIT  
-**Release:** wbR 1.0.0 — initial public source release. The core uses a full-grid model without automatic spatial tiling. Validate model outputs for your study area before scientific interpretation.
+**Code:** [github.com/drymixedconifer/wbR](https://github.com/drymixedconifer/wbR) · **License:** MIT  
+**Current package:** v1.1.0.9000 (development). The v6 scientific implementation is under active testing; results should be checked before scientific interpretation.
 
-## Contents
+---
 
-1. [Installation](#installation)
-2. [Inputs and spatial domain](#inputs-and-spatial-domain)
-3. [Run a model](#run-a-model)
-4. [How the model works](#how-the-model-works)
-5. [Configuration reference](#configuration-reference)
-6. [Raster and tabular outputs](#raster-and-tabular-outputs)
-7. [Seasonal snow and soil products](#seasonal-snow-and-soil-products)
-8. [Zonal time series](#zonal-time-series)
-9. [Prepared environment and restarts](#prepared-environment-and-restarts)
-10. [Computational requirements](#computational-requirements)
-11. [Interpretation and limitations](#interpretation-and-limitations)
-12. [Scientific references](#scientific-references)
+## What wbR calculates
 
-## Installation
+At each modeled grid cell, wbR follows precipitation through rain–snow partitioning, snow accumulation and melt, soil-water recharge and depletion, evaporative demand, realized water use, and excess water. Soil moisture and snowpack carry forward between months and years.
 
-Install the package from a local checkout after installing its R dependencies. A working C++ toolchain is required to compile the embedded scientific engine on first use.
+| Product | Interpretation |
+|---|---|
+| **Climatic water deficit (CWD)** | Atmospheric evaporative demand unmet by available water |
+| **Actual evapotranspiration (AET)** | Water returned to the atmosphere through evaporation and transpiration, represented jointly |
+| **Potential evapotranspiration (PET)** | Reference atmospheric demand calculated from water–energy conditions |
+| **Soil water** | Modeled soil-water storage through time |
+| **Snow** | Snow accumulation, storage, and melt, including seasonal summaries |
+| **Runoff** | Water exceeding the modeled available storage; *not routed streamflow* |
+
+Additional output variables include precipitation, snowfall, snowmelt, water reaching the soil, temperature, incoming and net radiation, and vapor pressure deficit. Outputs can be written as annual GeoTIFFs, monthly GeoTIFFs, or monthly and annual **zonal tables** for watersheds, ecological classes, and other user-defined geography.
+
+## Why water balance?
+
+Temperature and precipitation alone cannot describe ecological water availability. The same precipitation regime can produce different outcomes on a cool north-facing slope, a sun-exposed ridge, or a deep-soiled valley. `wbR` integrates **water supply, energy demand, terrain, and soil storage** to quantify this heterogeneity rather than treating a climate grid cell as a uniform landscape.
+
+The model is deliberately **vegetation-independent**: it represents climatic and physical controls on water balance rather than predicting separate vegetation-specific transpiration and soil evaporation. This provides a consistent environmental baseline for comparing landscapes and investigating vegetation response.
+
+## Install
+
+A working R installation (R ≥ 4.2) and C++ compilation toolchain are required. The scientific engine uses `terra`, `prism`, `Rcpp`, and `RcppParallel`.
 
 ```r
-install.packages(c("terra", "prism", "Rcpp", "RcppParallel"))
-install.packages("/path/to/wbR", repos = NULL, type = "source")
+install.packages(c("remotes", "terra", "prism", "Rcpp", "RcppParallel"))
+remotes::install_github("drymixedconifer/wbR", upgrade = "never")
 library(wbR)
 
-cfg <- wb_config()   # all installed defaults, as an editable named list
-names(cfg)           # available settings
-wb_engine_info()     # installed source and checksum
+cfg <- wb_config()              # compact, editable configuration
+names(cfg)
+wb_config(advanced = TRUE)      # scientific and technical controls
 ```
 
-The installed package supplies `wb_config()`, `wb_run()`, and `wb_engine_info()`. Configuration does not execute the simulation; `wb_run(cfg)` does.
+> The GitHub repository must contain the intended release before installation. The development archive and currently published GitHub version may differ.
 
-## Inputs and spatial domain
+## Quick start
 
-| Input | Purpose | Guidance |
-|---|---|---|
-| Digital elevation model (`dem_path`) | Model grid, elevation, slope, aspect and latitude | Confirm horizontal CRS and elevation units. Resolution follows the DEM and aggregation factor. |
-| Area of interest (`aoi_path` or `aoi_bbox`) | Geographic extent / mask | Vector geography or configured longitude–latitude bounding box. |
-| Available water capacity (`awc_path`) | Maximum modeled soil-water storage | Check units (`awc_units`) and valid-data mask. |
-| PRISM monthly data (`prism_root`) | Precipitation and temperature; configured atmospheric normals | Local cache is reused; additional downloads may be needed. |
-| Optional zones (`zonal_path`) | Spatial aggregation of monthly model results | One-layer categorical raster, polygon features, or points. |
-
-**Missing-data handling:** Raster NoData codes such as `-9999` must be identified correctly in the inputs. Do not interpret them as real elevation or soil capacity. Set `dem_z_units` explicitly when the DEM's units are uncertain; automatic inference uses an elevation-range heuristic.
-
-The model uses a projected metric working grid (`metric_crs`, normally `EPSG:5070`). `dem_aggregate_fact = 1L` retains the native input DEM resolution; `3L` aggregates 3 × 3 source cells. It does not directly specify a resolution in meters.
-
-## Run a model
-
-Use `wb_config()` to obtain the full set of installed defaults. Change only parameters needed for your domain and requested outputs. `wb_run(cfg)` executes the run.
-
-The following is a complete **example of the principal settings**. Replace paths, years, and identifiers with those for your study area. All other parameters remain available through `wb_config()`.
+Point wbR at an elevation raster, soil available-water-capacity raster, AOI, and a PRISM cache directory. Choose the analysis period and the outputs you want.
 
 ```r
 library(wbR)
 
 cfg <- wb_config()
 
-# Inputs
-cfg$dem_path <- "/project/terrain/dem.tif"
-cfg$aoi_path <- "/project/boundaries/study_area.gpkg"
-cfg$awc_path <- "/project/soils/awc_mm.tif"
-cfg$prism_root <- "/project/climate/PRISM"
-cfg$output_root <- "/project/results"
+# Geography and environmental inputs
+cfg$dem_path     <- "data/dem.tif"
+cfg$awc_path     <- "data/awc_mm.tif"
+cfg$aoi_path     <- "data/watershed.gpkg"
+cfg$prism_root   <- "data/PRISM"
+cfg$output_root  <- "outputs"
 
-# Grid and simulation years
-cfg$dem_aggregate_fact <- 1L
-cfg$dem_z_units <- "meters"  # or "feet"; "auto" is available
-cfg$base_years <- 1988:1989
+# Consecutive initialization and analysis periods
+cfg$base_years   <- 1988:1989
 cfg$years_annual <- 1990:2025
-cfg$months_out <- 1:12
 
-# Persistent, reusable terrain preparation
-cfg$prepared_environment <- TRUE
-cfg$environment_cache <- "/project/cache/prepared_environment"
+# Model resolution and PET formulation
+cfg$dem_aggregate_fact <- 1L
+cfg$pet_method <- "penman_monteith"
+cfg$wind_path  <- "data/wind_u2_monthly.tif"  # or use wind_constant (advanced)
 
-# Annual rasters and mean-of-period summary maps
+# Annual output rasters
+cfg$outputs_to_write <- c("cwd", "aet")
 cfg$write_rasters <- TRUE
-cfg$outputs_to_write <- c("aet", "cwd", "pet", "ppt", "snow", "soil", "runoff")
-cfg$summarize <- TRUE
-
-# Monthly rasters are optional and independent of the zonal histories
 cfg$monthly_output <- FALSE
-cfg$monthly_years <- NULL
-
-# Optional in-simulation watershed time series
-cfg$zonal_path <- "/project/boundaries/HUC12.gpkg"
-cfg$zonal_id_field <- "HUC12"
-cfg$zonal_monthly <- c("aet", "cwd", "pet", "ppt", "soil", "pack", "runoff", "melt")
-cfg$zonal_annual <- TRUE
-
-# Retain compatible restart checkpoints after an interruption
-cfg$resume <- TRUE
 
 wb_run(cfg)
 ```
 
-Set `cfg$zonal_path <- NULL` to disable zonal processing. For a categorical raster of zones, set `cfg$zonal_id_field <- NULL`. To enable monthly TIFFs instead, set `monthly_output` to a character vector of variables and supply corresponding `monthly_years` values. **If `monthly_output <- FALSE`, use `monthly_years <- NULL`.**
+`base_years` initialize the state preceding the analysis period; their outputs are **not** written by default. Analysis starts from the final soil and snow state of the preceding baseline year—there is no user-selectable reset to equilibrium.
 
-## How the model works
+### Choose the outputs you need
 
-wbR follows the sequence below. Soil-water and snowpack states carry between months and years; the model is not a series of independent annual calculations.
-
-1. **Validate settings and discover inputs.** Check paths, periods, raster products and available memory; locate cached PRISM data and download missing inputs if permitted.
-2. **Prepare environmental geography.** Align the DEM, area of interest and available water capacity; derive slope, aspect, latitude, heat load and related terrain products. Reuse a matching prepared-environment cache when available.
-3. **Adjust climate to terrain.** Use spatially varying elevation relationships fitted from PRISM climate and topography. Local estimation is governed by the lapse-window and coefficient-limit parameters. The full-grid core does not automatically substitute a single regional lapse rate.
-4. **Calculate radiation and PET.** Monthly terrain-aware radiation uses solar geometry, slope, aspect, elevation and configured cloud-transmittance/humidity normals. Priestley–Taylor is the default PET formulation; Hamon is optional.
-5. **Spin up initial states.** Repeated climatological months allow soil water and snowpack to approach a stable starting condition subject to configured convergence tolerances.
-6. **Simulate baseline and analysis years.** Each calendar month partitions precipitation into rain and snow, calculates melt and water reaching the soil, estimates potential and actual evapotranspiration, updates soil storage, calculates deficit and excess water, and carries the remaining states into the next month.
-7. **Collect outputs during execution.** Requested annual rasters and monthly rasters are written as configured. Monthly zonal means are calculated from model arrays, without requiring monthly TIFFs.
-8. **Assemble period products.** The analysis-year raster stacks and optional mean-of-period rasters are saved; compatible checkpoints enable restarting interrupted runs.
-
-The baseline years are **simulation/initialization years**; they are not necessarily the most appropriate scientific climatology. Analysis-period mean maps can be generated independently using `summarize = TRUE`.
-
-## Configuration reference
-
-| Setting | Description |
-|---|---|
-| `dem_path`, `aoi_path`, `awc_path`, `prism_root`, `output_root` | Required input and destination paths |
-| `dem_aggregate_fact`, `dem_z_units`, `metric_crs` | Model grid and DEM interpretation |
-| `base_years`, `years_annual`, `months_out`, `analysis_initialization` | Time periods and starting states |
-| `lapse_window_km`, `lapse_t_limits`, `lapse_p_limits` | Spatially varying climate lapse-rate estimation |
-| `pet_method`, `pt_alpha`, `cloud_transmittance`, `humidity_source` | PET and atmospheric controls |
-| `snow_t_all`, `rain_t_all`, `melt_method`, `melt_mm_per_deg_day`, `melt_mm_per_mj`, `snow_albedo` | Precipitation phase and snowmelt |
-| `spinup_max_iter`, `soil_tol_mm`, `pack_tol_mm`, `spinup_action` | Spin-up convergence |
-| `outputs_to_write`, `summarize`, `write_rasters` | Annual raster products and reporting-period means |
-| `monthly_output`, `monthly_years`, `monthly_chunk`, `monthly_datatype` | Monthly TIFFs and their memory/disk tradeoffs |
-| `zonal_path`, `zonal_id_field`, `zonal_monthly`, `zonal_annual` | In-simulation zonal CSVs |
-| `prepared_environment`, `environment_cache`, `resume` | Reuse of terrain data and restart behavior |
-| `memory_limit_gb`, `terra_memfrac`, `wb_cores` | Computational resources |
-
-To view **every parameter and its current default**, run `str(wb_config())`. The canonical full list is in `inst/config/defaults.R`.
-
-## Raster and tabular outputs
-
-| Annual output selector | Interpretation | Units |
-|---|---|---|
-| `cwd` | Sum of unmet potential evapotranspiration (climatic water deficit) | mm |
-| `aet` | Sum of actual evapotranspiration | mm |
-| `pet` | Sum of potential evapotranspiration | mm |
-| `ppt` | Sum of modeled precipitation | mm |
-| `runoff` | Sum of modeled excess water above soil storage capacity; **not routed streamflow** | mm |
-| `melt`, `snowfall`, `water` | Sum of corresponding monthly water fluxes | mm |
-| `snow` / `pack` | Mean September–May end-of-month snow-water equivalent | mm SWE |
-| `snow_peak` | Maximum monthly snow-water equivalent in the September–May season | mm SWE |
-| `soil` | Mean March–October end-of-month soil-water storage | mm |
-
-`outputs_to_write` selects annual raster variables. The model also supports optional monthly TIFF variables such as `tmean`, `rs`, and `rnet`. Consult `names(wb_config())` and the installed defaults for supported controls and the `monthly_output` variable list.
-
-**Period summaries.** When `cfg$summarize <- TRUE`, `results/summaries/` receives a mean raster for each selected output for the baseline and analysis periods. For flux variables, this is the **mean annual total**; for `snow` and `soil`, it is the **mean of their seasonal annual statistics**. The analysis-year multilayer stacks remain available separately. Missing incomplete snow seasons are excluded from means; valid zero-snow seasons are included.
-
-## Seasonal snow and soil products
-
-Snowpack and soil moisture are **stored states**, not precipitation or other monthly fluxes. A December snapshot is not a representative annual measure for many ecological applications.
-
-- **Snow year:** September of the preceding calendar year through May of the labeled year. For example, snow year 2020 includes September–December 2019 and January–May 2020. The annual `snow`/`pack` output averages the nine end-of-month SWE states; `snow_peak` takes their maximum. These are not seasonal snowfall totals.
-- **Soil-water year:** `soil` is the mean of March–October end-of-month soil-water storage in the labeled calendar year.
-- **Incomplete first season:** When the preceding autumn is unavailable, the first snow-year product is missing (`NA`), not zero. This can occur in the first baseline year. Subsequent complete seasons are retained for climatological averages.
-
-For finer seasonal analysis, request `pack` and `soil` in `zonal_monthly` and compute alternate date windows from the monthly history.
-
-## Zonal time series
-
-Zonal summaries are generated **during the simulation** from in-memory monthly results. They do not require saved monthly rasters and are suited to watersheds, ecological units and categorical maps.
+For additional annual products, change the selection and run again:
 
 ```r
-cfg$monthly_output <- FALSE
-cfg$monthly_years <- NULL
-cfg$zonal_path <- "/project/regions/ecological_types.tif"  # factor/category raster
-cfg$zonal_id_field <- NULL
-cfg$zonal_monthly <- c("cwd", "aet", "pet", "ppt", "soil", "pack", "runoff")
-cfg$zonal_annual <- TRUE
+cfg$outputs_to_write <- c("soil", "snow", "runoff")
+wb_run(cfg)
 ```
 
-The `zonal/` directory contains four primary tables:
+Supported annual selections in the current engine are:
 
-| File | Description |
-|---|---|
-| `zonal_monthly.csv` | Monthly zonal means, spatial standard deviation, variance, coefficient of variation, and coverage. |
-| `zonal_annual.csv` | Annual zonal summaries from the modeled monthly history. |
-| `zonal_monthly_climatology.csv` | Mean seasonal cycle by zone, calendar month, and variable across the analysis years. Includes interannual variability (`temporal_sd`, `temporal_variance`) and mean within-zone dispersion (`mean_spatial_sd`, `mean_spatial_variance`), along with coverage and contributing-year counts. |
-| `zonal_metadata.csv` | Zone identifiers, labels, and contributing-cell information. |
+```r
+c("cwd", "aet", "pet", "ppt", "soil", "pack", "snow",
+  "snow_peak", "melt", "runoff", "snowfall", "water")
+```
 
-Monthly records identify zone, period (`baseline` or `analysis`), year, month, variable, spatial mean and valid-cell coverage. Monthly climatologies use **analysis years**, not the initialization baseline. Spatial variability measures differences among cells inside a zone; temporal variability measures differences among years in the zone's monthly mean. The coefficient of variation can be undefined where the mean is zero. Annual spatial variance must not be inferred by simply adding monthly variance estimates. For polygon zones, assignment is based on cell centers; disconnected cells with the same factor-raster category are treated as one zone. These summaries are spatial means, **not basin-integrated water volumes**. A zonal mean runoff depth is not a routed streamflow prediction.
+Annual **`snow`** and **`snow_peak`** are seasonal snow metrics, not equivalent to calendar-year precipitation sums. For detailed monthly water and energy variables, use `monthly_output`; see the advanced configuration and engine documentation for available variables and units.
 
-## Prepared environment and restarts
+Because very large regional runs can exceed RAM limits when assembling many outputs, wbR supports separate output batches. The development version has a **persistent baseline-end initialization cache** intended to reuse spin-up and baseline state when the scientific inputs have not changed; this pathway still needs end-to-end validation.
 
-With `prepared_environment = TRUE`, wbR stores prepared static geography for reuse between compatible simulations. The cache includes prepared DEM/terrain and soil-alignment products and is independent of the annual simulation output directory. A matching input geography and matching relevant preparation settings permit reuse; modifications to the input DEM, AOI, soil raster or grid parameters may invalidate the cache. **The monthly clear-sky radiation matrix is not yet persistently cached** and may be recalculated.
+### Zonal-only analysis
 
-Restart checkpoints serve a different purpose: they record progress and carried soil/snow state during a particular simulation. A changed scientific-engine revision or incompatible configuration can invalidate those checkpoints even when the prepared-environment cache is still reusable.
+Compute monthly and annual summaries by watersheds, vegetation types, or other geographic units **without writing annual raster products**:
 
-## Computational requirements
+```r
+cfg <- wb_config()
 
-The current core uses an **in-memory, full-grid simulation**. Its practical spatial limit depends on the available RAM, modeled cell count, raster alignment/reprojection requirements and concurrent temporary arrays. The observed peak resource demand is often during **initialization and environmental preparation**, when multiple large rasters are read or processed. The compiled monthly/yearly calculations are typically much faster after initialization. Writing and assembling many output rasters can impose another time, memory and disk-space cost.
+cfg$dem_path     <- "data/dem.tif"
+cfg$awc_path     <- "data/awc_mm.tif"
+cfg$aoi_path     <- "data/watershed.gpkg"
+cfg$prism_root   <- "data/PRISM"
+cfg$output_root  <- "outputs_zonal"
+cfg$base_years   <- 1988:1989
+cfg$years_annual <- 1990:2025
+cfg$wind_path    <- "data/wind_u2_monthly.tif"
 
-Prepared-environment caching reduces repeated preprocessing but does **not** remove the RAM required to load prepared cell data for a run. wbR checks estimated memory demands and may refuse jobs too large for the configured budget. To reduce load, decrease the geographic extent, increase `dem_aggregate_fact`, reduce requested raster products or use a machine with more memory. The simple core does not promise automatic spatial tiling.
+cfg$write_rasters <- FALSE
+cfg$zonal_path <- "data/subwatersheds.gpkg"
+cfg$zonal_id_field <- "huc12"  # replace with a field in your vector layer
 
-## Interpretation and limitations
+wb_run(cfg)
+```
 
-wbR is a **vegetation-independent climatic water-balance model**. AET and CWD are modeled water-balance quantities, not direct observations of transpiration or plant water stress. The snow formulation uses monthly inputs and parameterized precipitation phase and melt. Terrain radiation incorporates slope and aspect but does not presently account for horizon shading by surrounding topography. Atmospheric transmittance and humidity may use monthly climatological normals rather than year-specific observations. The model's runoff variable represents water exceeding modeled storage capacity and is **not routed through a stream network**. Validate modeled results against measurements and independent data before interpreting local-scale predictions.
+Zonal inputs can be categorical rasters or supported vector geometries. Zonal tables are collected during model simulation, so monthly GeoTIFFs are not required. `outputs_to_write` and `monthly_years` do not select the variables or years included in zonal CSVs; use `zonal_monthly` and `years_annual` respectively.
 
-## Scientific references
+## Climate and environmental inputs
 
-- Stephenson, N. L. (1990). Climatic control of vegetation distribution: The role of the water balance. *The American Naturalist*, 135, 649–670. https://doi.org/10.1086/285067
-- Stephenson, N. L. (1998). Actual evapotranspiration and deficit: Biologically meaningful correlates of vegetation distribution across spatial scales. *Journal of Biogeography*. https://doi.org/10.1046/j.1365-2699.1998.00233.x
-- Lutz, J. A., van Wagtendonk, J. W., & Franklin, J. F. (2010). Climatic water deficit, tree species ranges, and climate change in Yosemite National Park. *Journal of Biogeography*, 37, 936–950. https://doi.org/10.1111/j.1365-2699.2009.02268.x
-- McCune, B., & Keon, D. (2002). Equations for potential annual direct incident radiation and heat load. *Journal of Vegetation Science*, 13, 603–606. https://doi.org/10.1111/j.1654-1103.2002.tb02087.x
-- Priestley, C. H. B., & Taylor, R. J. (1972). On the assessment of surface heat flux and evaporation using large-scale parameters. *Monthly Weather Review*, 100, 81–92. https://doi.org/10.1175/1520-0493(1972)100%3C0081:OTAOSH%3E2.3.CO;2
-- Hamon, W. R. (1961). Estimating potential evapotranspiration. *Journal of the Hydraulics Division*, 87, 107–120.
-- Kustas, W. P., Rango, A., & Uijlenhoet, R. (1994). A simple energy budget algorithm for the snowmelt runoff model. *Water Resources Research*, 30, 1515–1527. https://doi.org/10.1029/94WR00152
-- Hock, R. (2003). Temperature index melt modelling in mountain areas. *Journal of Hydrology*, 282, 104–115. https://doi.org/10.1016/S0022-1694(03)00257-9
-- Allen, R. G., Pereira, L. S., Raes, D., & Smith, M. (1998). *Crop evapotranspiration: Guidelines for computing crop water requirements*. FAO Irrigation and Drainage Paper 56. https://www.fao.org/4/X0490E/X0490E00.htm
-- Daly, C., et al. (2008). Physiographically sensitive mapping of climatological temperature and precipitation across the conterminous United States. *International Journal of Climatology*, 28, 2031–2064. https://doi.org/10.1002/joc.1688
+| Input | Description | Notes |
+|---|---|---|
+| **DEM** | Grid, elevation, slope, aspect, latitude, radiation | Verify horizontal CRS and vertical units |
+| **AOI** | Study area boundary | Mask and geographic extent |
+| **AWC** | Soil available-water storage | Typically supplied in millimeters; confirm data meaning and units |
+| **PRISM** | Monthly precipitation and temperature; VPD for Penman–Monteith; atmospheric normals | Historical data may require substantial disk space |
+| **Wind** | Twelve-month 2 m wind-speed climatology | Optional constant-speed fallback through `wind_constant` |
+| **Zones** (optional) | Watersheds, classifications, polygons, or points | Used for zonal time series |
+
+PRISM VPD is supplied in **hPa** and converted internally to **kPa** for the Penman–Monteith calculations. Do **not** manually modify the original PRISM data to perform that conversion.
+
+### PRISM storage modes
+
+```r
+cfg$prism_mode <- "full"    # existing full-grid workflow (default)
+# cfg$prism_mode <- "subset" # retain buffered AOI subsets locally
+# cfg$prism_mode <- "local"  # existing cache only; no downloads
+```
+
+Subset mode is designed to save **persistent disk space** by downloading, extracting, cropping, and retaining buffered rasters. The current official ZIP-based acquisition path may still transfer complete source archives over the network; subset mode does **not** promise reduced download bandwidth. Buffered coverage is needed for interpolation and local lapse-rate fitting.
+
+## Model approach
+
+The model operates monthly on a grid derived from the DEM. Its core processes include:
+
+1. **Spatial climate preparation:** Interpolate PRISM fields and adjust temperature and precipitation for elevation using locally fitted lapse relationships.
+2. **Radiation and PET:** Compute terrain-dependent shortwave radiation and longwave terms. Penman–Monteith is the v6 default, using PRISM vapor pressure deficit and 2 m wind speed; Priestley–Taylor and Hamon are alternative methods.
+3. **Snow balance:** Partition precipitation between rain and snow, maintain snowpack, and estimate melt using temperature and available radiation.
+4. **Soil-water accounting:** Track available storage, AET, unmet demand (CWD), and excess water (runoff), carrying the modeled state between months and years.
+5. **Output and aggregation:** Produce annual raster summaries, optional monthly spatial products, and in-simulation zonal tables.
+
+This is a **monthly climatic water-balance model**, not a hydrodynamic streamflow-routing model. Its runoff output represents modeled excess water prior to channel routing, transmission losses, or groundwater processes not explicitly resolved by the model.
+
+## Reuse, reproducibility, and performance
+
+- **Prepared-environment cache:** Reuses terrain and soil preparation when inputs and geometry match.
+- **Initialization cache (development):** Saves the state at the end of `base_years` for reuse across output configurations with matching scientific inputs.
+- **Resume:** Retains checkpoints to recover interrupted runs when configurations remain compatible.
+- **Scientific fingerprinting:** Prevents inappropriate reuse when model code or relevant inputs change.
+- **Full-grid computation:** The current engine does **not** automatically tile the spatial calculation; memory scales with the number of modeled cells and requested intermediate/output arrays.
+
+For regional work, initialization and output assembly can require substantial memory and temporary disk space. Start with a small AOI, confirm climate coverage and units, and increase spatial extent only after inspecting performance. Use separate output batches when the complete output set exceeds available memory.
+
+## Current development status and limitations
+
+`wbR` is research software under active development. The v6 integration includes Penman–Monteith PET, PRISM VPD handling, zonal-only execution, and initialization caching. Source-level fixes have been made during integration, but **this development package has not yet passed comprehensive cross-platform checks or end-to-end scientific regression tests**. Do not assume numerical equivalence between v5.5 and v6, or that all optional workflows have been validated.
+
+Important interpretation limits:
+
+- Monthly climate and static atmospheric normals cannot reproduce all event-scale weather, interception, soil, or snow processes.
+- Water-balance estimates are vegetation-independent and should not be interpreted as direct measurements of canopy transpiration or vegetation-mediated hydrological change.
+- Annual seasonal-snow products span a cold season; interpretation depends on correctly carried prior-autumn state. Missing values must not be treated as zero.
+- PRISM coverage, elevation units, AWC definitions, wind assumptions, and domain resolution materially affect results.
+- Modeled runoff is **not** equivalent to observed stream discharge.
+
+For reproducible work, record the wbR package version or commit, input data versions, spatial resolution, PET method, years, and complete effective configuration (`wb_config(advanced = TRUE)` is the starting point for exploring available parameters).
+
+## Citation and scientific foundations
+
+If using wbR in research, cite the software repository **and the specific version or commit**. The package includes `CITATION.cff` for citation metadata.
+
+The scientific framing follows the development of climatic water deficit and actual evapotranspiration as ecological measures of water availability, including:
+
+- Stephenson, N. L. (1998). Actual evapotranspiration and deficit: biologically meaningful correlates of vegetation distribution across spatial scales. *Journal of Biogeography*, **25**, 855–870.
+- Lutz, J. A., van Wagtendonk, J. W., & Franklin, J. F. (2010). Climatic water deficit, tree species ranges, and climate change in Yosemite National Park. *Journal of Biogeography*, **37**, 936–950. https://doi.org/10.1111/j.1365-2699.2009.02268.x
+- McCune, B., & Keon, D. (2002). Equations for potential annual direct incident radiation and heat load. *Journal of Vegetation Science*, **13**, 603–606.
+
+`wbR` implements its **own documented numerical formulations and parameterizations**; citing foundational literature does not imply that every historical equation is reproduced verbatim.
+
+## Contributing and reporting issues
+
+Issues, reproducible test cases, and constructive feedback are welcome through [GitHub Issues](https://github.com/drymixedconifer/wbR/issues). Include the wbR version or commit, operating system, R version, relevant configuration, a minimal reproducible example where possible, and the complete error message or traceback. Do not publish credentials or private filesystem information in issue reports.
 
 ---
 
-For questions or issue reports, use the [wbR repository issue tracker](https://github.com/drymixedconifer/wbR/issues). Cite the software using the repository's `CITATION.cff` file.
+*wbR · Water balance across landscapes, through time.*

@@ -8,7 +8,7 @@
   if (!is.null(engine_path)) {
     path <- normalizePath(path.expand(engine_path), mustWork = TRUE)
   } else {
-    path <- system.file("engine", "water_balance_v5.5_functions.R", package = "wbR")
+    path <- system.file("engine", "water_balance_v6_functions.R", package = "wbR")
     if (!nzchar(path)) stop("Cannot locate the installed wbR engine.")
   }
   path
@@ -27,24 +27,30 @@
   env
 }
 
-#' Create an editable v5.5 water-balance configuration
+#' Create an editable v6 water-balance configuration
 #'
 #' The result is a plain named list. Adjust its values and pass it to
 #' [wb_run()]. The original settings remain visible in the package's
 #' `inst/config/defaults.R` development file.
 #' @param engine_path Optional path to a development engine source file.
-#' @return A list of v5.5 configuration parameters.
+#' @param advanced Return the full scientific and infrastructure configuration
+#'   rather than the compact everyday configuration.
+#' @return A named list of editable settings.
 #' @export
-wb_config <- function(engine_path = NULL) {
-  path <- system.file("config", "defaults.R", package = "wbR")
-  if (!nzchar(path)) stop("Cannot locate the installed wbR configuration.")
-  cfg_env <- new.env(parent = asNamespace("wbR"))
-  cfg_env$.wb_functions_path <- .wbr_engine_path(engine_path)
-  sys.source(path, envir = cfg_env)
-  cfg_env$cfg
+wb_config <- function(engine_path = NULL, advanced = FALSE) {
+  defaults <- .wbr_config_defaults(.wbr_engine_path(engine_path))
+  if (isTRUE(advanced)) return(defaults)
+  keys <- c(
+    'dem_path','awc_path','aoi_path','aoi_bbox','prism_root','prism_mode',
+    'prism_buffer_km','output_root','base_years','years_annual',
+    'months_out','dem_aggregate_fact','pet_method','wind_path',
+    'outputs_to_write','write_rasters','monthly_output','zonal_path',
+    'zonal_id_field','zonal_monthly','points_path','summarize','write_baseline',
+    'wb_cores','resume')
+  defaults[intersect(keys, names(defaults))]
 }
 
-#' Run the v5.5 water-balance model
+#' Run the v6 water-balance model
 #'
 #' Uses the installed scientific engine unless an explicitly supplied development
 #' engine source is provided. Zonal collection happens during simulation; monthly
@@ -58,8 +64,14 @@ wb_config <- function(engine_path = NULL) {
 wb_run <- function(config, engine_path = NULL) {
   if (!is.list(config)) stop("config must be a named list from wb_config().")
   path <- .wbr_engine_path(engine_path)
-  config$code_md5 <- unname(tools::md5sum(path))
-  .wbr_load_engine(path)$wb_main(config)
+  if ('analysis_initialization' %in% names(config))
+    stop('analysis_initialization has been removed: analysis always follows the baseline state.')
+  defaults <- .wbr_config_defaults(path)
+  unknown <- setdiff(names(config), names(defaults))
+  if (length(unknown)) stop('Unknown wbR configuration setting(s): ', paste(unknown, collapse=', '))
+  defaults[names(config)] <- config
+  defaults$code_md5 <- unname(tools::md5sum(path))
+  .wbr_load_engine(path)$wb_main(defaults)
 }
 
 #' Report the selected engine source and revision

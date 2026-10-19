@@ -11,6 +11,8 @@ AOI_BBOX <- NULL                # v5.4: set to c(xmin, xmax, ymin, ymax) in deci
 AWC_PATH <- "/YOUR PATH/POLARIS_AWC_western_states.tif"
 PRISM_ROOT <- "/YOUR PATH"
 PRISM_RES <- "800m"
+PRISM_MODE <- "full"   # "full": existing archive; "subset": compact buffered AOI cache; "local": no downloads
+PRISM_BUFFER_KM <- 25 # Additional buffer (lapse window + 4 PRISM cells are also respected)
 PRISM_NORMAL_END_YEAR <- 2020L  # Existing *_2020MM_avg_30y cache = 1991-2020 normals.
 
 # Final rasters go directly here; filenames follow MONTHS_OUT and the year ranges.
@@ -23,7 +25,8 @@ BASE_YEARS <- 1948:1949        # Warm-up after spin-up; the baseline-mean raster
 YEARS_ANNUAL <- 1950:2025
 MONTHS_OUT <- 1:12
 OUTPUTS_TO_WRITE <- c("cwd", "aet")
-SUMMARIZE <- TRUE # Period-mean rasters in outputs/summaries
+SUMMARIZE <- FALSE # No period means unless requested
+  WRITE_BASELINE <- FALSE # Baseline used for initialization only
 RUN_AOIS_SEPARATELY <- FALSE   # Required for this flat layout (one combined geography).
 AOI_FEATURES_TO_RUN <- "all"
 AOI_LABEL_FIELD <- "name"
@@ -34,7 +37,7 @@ AOI_LABEL_FIELD <- "name"
 ZONAL_PATH <- NULL
 ZONAL_ID_FIELD <- NULL       # Polygon/point attribute; NULL uses feature order
 ZONAL_MONTHLY <- c("cwd", "aet", "pet", "ppt", "water", "soil", "pack",
-                   "snowfall", "melt", "tmean", "rs", "rnet")
+                   "snowfall", "melt", "tmean", "rs", "rnet", "vpd", "runoff")
 ZONAL_ANNUAL <- TRUE        # Annual CSV (monthly flux sums; state/radiation means)
 ZONAL_PLOTS <- FALSE        # Reserved, no automatic plotting in this version
 
@@ -124,7 +127,7 @@ AWC_DEPTH_MM <- NA_real_      # Optional KNOWN profile depth for plausibility ch
 # Heat load is divided by the flat-surface value at each cell's own latitude, so level ground has a modifier of exactly 1 and only slope and aspect change PET. Daylength uses each DEM cell's latitude. Snow equations and the monthly non-leap calendar are unchanged.
 
 # ---- Potential evapotranspiration and radiation (new in 5.0) ----
-PET_METHOD <- "priestley_taylor"   # "priestley_taylor" or "hamon" (Hamon x heat load, exactly as 4.0).
+PET_METHOD <- "penman_monteith"   # "priestley_taylor" or "hamon" (Hamon x heat load, exactly as 4.0).
 PT_ALPHA <- 1.26                   # Priestley-Taylor coefficient (1.26 is the standard well-watered value).
 SURFACE_ALBEDO <- 0.23             # Shortwave albedo for net radiation and terrain-reflected light (FAO reference surface).
 RAD_DIFFUSE_FRACTION <- 0.2        # Share of clear-sky radiation arriving as diffuse light (scaled by sky view on slopes).
@@ -192,12 +195,18 @@ GDAL_OPTS <- c("COMPRESS=LZW", "PREDICTOR=3", "TILED=YES", "BIGTIFF=IF_SAFER")
 # Changing years changes filenames. Repeating the same months/years replaces
 # those result rasters; the report appends a dated run record. No AOI names are used.
 
+# v6 atmospheric inputs (all other original package controls remain unchanged)
+WIND_PATH <- NULL
+WIND_CONSTANT <- 2.0
+AERO_SCALE <- 1.0
+
 cfg <- list(
   base_dir = BASE_DIR, dem_path = DEM_PATH, aoi_path = AOI_PATH, aoi_bbox = AOI_BBOX, awc_path = AWC_PATH,
-  prism_root = PRISM_ROOT, prism_res = PRISM_RES, prism_normal_end_year = PRISM_NORMAL_END_YEAR,
+  prism_root = PRISM_ROOT, prism_res = PRISM_RES, prism_mode = PRISM_MODE,
+  prism_buffer_km = PRISM_BUFFER_KM, prism_normal_end_year = PRISM_NORMAL_END_YEAR,
   output_root = OUTPUT_ROOT, prepared_environment = PREPARED_ENVIRONMENT,
   environment_cache = ENVIRONMENT_CACHE, base_years = BASE_YEARS, years_annual = YEARS_ANNUAL,
-  months_out = MONTHS_OUT, outputs_to_write = OUTPUTS_TO_WRITE, summarize = SUMMARIZE,
+  months_out = MONTHS_OUT, outputs_to_write = OUTPUTS_TO_WRITE, summarize = SUMMARIZE, write_baseline = WRITE_BASELINE,
   run_aois_separately = RUN_AOIS_SEPARATELY, aoi_features_to_run = AOI_FEATURES_TO_RUN,
   aoi_label_field = AOI_LABEL_FIELD, dem_aggregate_fact = DEM_AGGREGATE_FACT,
   dem_z_units = DEM_Z_UNITS, metric_crs = METRIC_CRS, dem_source_crs = DEM_SOURCE_CRS,
@@ -206,7 +215,7 @@ cfg <- list(
   spinup_max_iter = SPINUP_MAX_ITER, soil_tol_mm = SOIL_TOL_MM, pack_tol_mm = PACK_TOL_MM,
   spinup_max_pct = SPINUP_MAX_PCT, spinup_action = SPINUP_ACTION,
   analysis_initialization = ANALYSIS_INITIALIZATION,
-  pet_method = PET_METHOD, pt_alpha = PT_ALPHA, surface_albedo = SURFACE_ALBEDO,
+  pet_method = PET_METHOD, wind_path = WIND_PATH, wind_constant = WIND_CONSTANT, aero_scale = AERO_SCALE, pt_alpha = PT_ALPHA, surface_albedo = SURFACE_ALBEDO,
   rad_diffuse_fraction = RAD_DIFFUSE_FRACTION, rad_step_minutes = RAD_STEP_MINUTES,
   cloud_transmittance = CLOUD_TRANSMITTANCE, humidity_source = HUMIDITY_SOURCE,
   pet_diagnostics = PET_DIAGNOSTICS, memory_limit_gb = MEMORY_LIMIT_GB,
