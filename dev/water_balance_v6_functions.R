@@ -1238,7 +1238,7 @@ wb_validate <- function(cfg) {
       any(!cfg$months_out %in% 1:12)) stop("MONTHS_OUT must contain integers in 1:12.")
   cfg$months_out <- sort(unique(as.integer(cfg$months_out)))
   cfg$month_tag <- wb_month_tag(cfg$months_out)
-  valid_annual <- c("cwd", "aet", "pet", "ppt", "soil", "pack", "snow", "snow_peak", "melt", "runoff", "snowfall", "water")
+  valid_annual <- c("cwd", "aet", "pet", "ppt", "soil", "pack", "snow", "snow_peak", "melt", "runoff", "snowfall", "water", "balance")
   if (!length(cfg$outputs_to_write) || any(!cfg$outputs_to_write %in% valid_annual))
     stop("OUTPUTS_TO_WRITE must contain: ", paste(valid_annual, collapse = ", "))
   if (is.null(cfg$summarize)) cfg$summarize <- FALSE
@@ -1308,7 +1308,7 @@ wb_validate <- function(cfg) {
     if (!file.exists(cfg$zonal_path)) stop("Missing ZONAL_PATH: ", cfg$zonal_path)
   }
   if (is.null(cfg$zonal_monthly)) cfg$zonal_monthly <- character()
-  if (any(!cfg$zonal_monthly %in% wb_monthly_vars)) stop("Invalid zonal monthly variable")
+  if (any(!cfg$zonal_monthly %in% c(wb_monthly_vars, "balance"))) stop("Invalid zonal monthly variable")
   # ---- Snow (v5.3) ----
   for (field in c("snow_t_all", "rain_t_all", "melt_mm_per_deg_day", "melt_radiation_weight"))
     if (length(cfg[[field]]) != 1 || !is.finite(cfg[[field]])) stop("Invalid ", toupper(field))
@@ -2487,7 +2487,7 @@ wb_run_sequence <- function(site, cfg, index, years, initial, stage, mem, grids,
     zvars <- if (is.null(zonal)) character() else cfg$zonal_monthly
     annual_vars <- unique(c(if (emit_annual) ifelse(cfg$outputs_to_write %in% c("snow", "snow_peak"), "pack", cfg$outputs_to_write) else character(),
                             if (stage == "baseline") "pack" else character()))
-    needed <- unique(c(mvars, zvars, annual_vars))
+    needed <- unique(c(mvars, setdiff(zvars, "balance"), setdiff(annual_vars, "balance")))
     grid <- wb_grid_for(p, tmean, site, mem, grids)
     chunks <- if (!cfg$write_rasters) list(needed) else if (length(needed))
       split(needed, ceiling(seq_along(needed) / cfg$monthly_chunk)) else list(character())
@@ -2500,6 +2500,18 @@ wb_run_sequence <- function(site, cfg, index, years, initial, stage, mem, grids,
     # Preserve original annual CWD/AET values exactly as calculated by the engine.
     if (emit_annual && "cwd" %in% cfg$outputs_to_write) annual_values$cwd <- x[, "cwd"]
     if (emit_annual && "aet" %in% cfg$outputs_to_write) annual_values$aet <- x[, "aet"]
+    if (emit_annual && "balance" %in% cfg$outputs_to_write) {
+      if (identical(cfg$months_out, 1:12)) {
+        annual_values$balance <- x[, "aet"] - x[, "cwd"]
+      } else {
+        dc <- wb_year(mem, grid, p, tmean, state$soil, state$pack, site,
+                      monthly = as.integer(1L + 2L), vpd = vpd)
+        annual_values$balance <- rowSums(
+          dc[, paste0("aet_m", sprintf("%02d", cfg$months_out)), drop = FALSE] -
+          dc[, paste0("cwd_m", sprintf("%02d", cfg$months_out)), drop = FALSE])
+        rm(dc)
+      }
+    }
     zrows <- list()
     next_peak <- NULL
     collect <- function(dat, chunk) {
@@ -2537,6 +2549,20 @@ wb_run_sequence <- function(site, cfg, index, years, initial, stage, mem, grids,
     for (ch in chunks[-1]) {
       xc <- wb_year(mem, grid, p, tmean, state$soil, state$pack, site, monthly = mask_of(ch), vpd = vpd)
       collect(xc, ch); rm(xc); gc(verbose = FALSE)
+    }
+    if (!is.null(zonal) && "balance" %in% cfg$zonal_monthly) {
+      # Derive from paired cell-level monthly values, BEFORE zonal quantiles.
+      # A separate two-variable pass keeps the memory bound independent of other outputs.
+      dx <- wb_year(mem, grid, p, tmean, state$soil, state$pack, site,
+                    monthly = as.integer(1L + 2L), vpd = vpd)
+      for (m in 1:12) {
+        nm <- sprintf("%02d", m)
+        dx[, paste0("balance_m", nm)] <-
+          dx[, paste0("aet_m", nm)] - dx[, paste0("cwd_m", nm)]
+      }
+      zrows[[length(zrows) + 1L]] <- wb_zonal_chunk(
+        dx, "balance", zonal, yr, stage)
+      rm(dx); gc(verbose = FALSE)
     }
     if (emit_annual) {
       missing <- setdiff(cfg$outputs_to_write, names(annual_values))
@@ -2877,10 +2903,22 @@ wb_zonal_chunk <- function(x, vars, zonal, year, stage) {
     spatial_var[many] <- pmax(0, (sumsq[many] - sums[many]^2 / counts[many]) / (counts[many] - 1L))
     spatial_sd <- sqrt(spatial_var)
     spatial_cv <- ifelse(is.finite(mn) & abs(mn) > 0, spatial_sd / abs(mn), NA_real_)
+    # Within-zone empirical percentiles of individual modeled cells for this month.
+    # Match the NA semantics of mean/sd; do not confuse these with temporal quantiles.
+    spatial_q10 <- spatial_q90 <- rep(NA_real_, ng)
+    if (length(valid)) {
+      by_zone <- split(value[valid], group[valid])
+      q <- lapply(by_zone, stats::quantile, probs = c(0.10, 0.90),
+                  names = FALSE, na.rm = TRUE, type = 7)
+      idx <- as.integer(names(q))
+      spatial_q10[idx] <- vapply(q, `[`, numeric(1), 1L)
+      spatial_q90[idx] <- vapply(q, `[`, numeric(1), 2L)
+    }
     k <- k + 1L
     out[[k]] <- data.frame(zone_id = zonal$meta$zone_id, zone_label = zonal$meta$zone_label,
       stage = stage, year = year, month = m, variable = v,
-      mean = mn, spatial_sd = spatial_sd, spatial_variance = spatial_var, spatial_cv = spatial_cv,
+      mean = mn, spatial_q10 = spatial_q10, spatial_q90 = spatial_q90,
+      spatial_sd = spatial_sd, spatial_variance = spatial_var, spatial_cv = spatial_cv,
       n_cells = counts, n_zone_cells = zonal$meta$n_zone_cells,
       coverage = ifelse(zonal$meta$n_zone_cells > 0, counts / zonal$meta$n_zone_cells, NA_real_))
   }
@@ -2889,7 +2927,7 @@ wb_zonal_chunk <- function(x, vars, zonal, year, stage) {
 
 wb_zonal_annual <- function(monthly) {
   if (is.null(monthly) || !nrow(monthly)) return(NULL)
-  flux <- c("cwd", "aet", "pet", "water", "ppt", "snowfall", "melt")
+  flux <- c("cwd", "aet", "balance", "pet", "water", "ppt", "snowfall", "melt", "runoff")
   key <- interaction(monthly$zone_id, monthly$year, monthly$stage, monthly$variable, drop = TRUE)
   parts <- split(monthly, key)
   do.call(rbind, lapply(parts, function(d) {
@@ -2916,6 +2954,8 @@ wb_zonal_climatology <- function(monthly) {
       month = x$month[1], variable = x$variable[1],
       mean = avg_valid(x$mean), temporal_sd = sd_valid(x$mean),
       temporal_variance = if (sum(ok) > 1L) stats::var(x$mean[ok]) else NA_real_,
+      mean_spatial_q10 = avg_valid(x$spatial_q10),
+      mean_spatial_q90 = avg_valid(x$spatial_q90),
       mean_spatial_sd = avg_valid(x$spatial_sd),
       mean_spatial_variance = avg_valid(x$spatial_variance),
       mean_spatial_cv = avg_valid(x$spatial_cv),
@@ -2951,7 +2991,9 @@ wb_zonal_export <- function(cfg, site, stages, zonal) {
     "n_zone_cells is the number of modeled cells assigned to each zone.",
     "n_cells is the number of valid cells; coverage is their ratio.",
     "Monthly spatial_sd and spatial_variance are sample dispersion across valid modeled cells within each zone/month (n-1 denominator).",
+    "Monthly spatial_q10 and spatial_q90 are exact type-7 cell-value percentiles within each zone/month/year (valid cells only).",
     "Monthly spatial_cv is spatial_sd / abs(mean); undefined where zone mean is zero.",
+    "Climatology mean_spatial_q10 and mean_spatial_q90 average the annual spatial percentiles; they are NOT pooled space-time quantiles.",
     "zonal_monthly_climatology.csv uses analysis years only: mean is the average monthly zone mean across years.",
     "temporal_sd/temporal_variance in climatology describe interannual variability; mean_spatial_sd and mean_spatial_variance describe spatial variability.",
     "Annual zonal spatial variance is not inferred from monthly variances, because cross-month cell covariance is needed.",

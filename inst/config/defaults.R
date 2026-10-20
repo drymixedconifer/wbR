@@ -37,7 +37,7 @@ AOI_LABEL_FIELD <- "name"
 ZONAL_PATH <- NULL
 ZONAL_ID_FIELD <- NULL       # Polygon/point attribute; NULL uses feature order
 ZONAL_MONTHLY <- c("cwd", "aet", "pet", "ppt", "water", "soil", "pack",
-                   "snowfall", "melt", "tmean", "rs", "rnet", "vpd", "runoff")
+                   "snowfall", "melt", "tmean", "rs", "rnet", "vpd", "runoff", "balance")
 ZONAL_ANNUAL <- TRUE        # Annual CSV (monthly flux sums; state/radiation means)
 ZONAL_PLOTS <- FALSE        # Reserved, no automatic plotting in this version
 

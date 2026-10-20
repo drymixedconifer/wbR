@@ -209,3 +209,16 @@ Issues, reproducible test cases, and constructive feedback are welcome through [
 ---
 
 *wbR · Water balance across landscapes, through time.*
+
+### Zonal spatial quantiles
+
+Zonal monthly CSV output includes `spatial_q10` and `spatial_q90`: the 10th and 90th percentiles of **valid modeled cells** in each zone for a given year, month, and variable (R `quantile()` type 7). Existing means, spatial SD, variance, CV, coverage, and temporal dispersion are unchanged. The monthly climatology includes `mean_spatial_q10` and `mean_spatial_q90`, averages of the corresponding yearly spatial percentiles—not pooled spatial/temporal quantiles. Annual spatial percentiles cannot be derived from monthly marginal quantiles; no such estimate is added to annual tables.
+
+### Derived AET minus CWD
+
+Use `balance` in `outputs_to_write` for an annual raster of **AET − CWD** (mm), or in `zonal_monthly` for monthly cell-level spatial statistics, including q10 and q90. The zonal quantiles are calculated **after subtracting CWD from AET in each modeled cell**; they are not the difference of the separate AET and CWD quantiles. Annual results respect `months_out`. This is a derived diagnostic, not a new water-balance equation. It is not currently a standalone `monthly_output` GeoTIFF option.
+
+```r
+cfg$outputs_to_write <- c("cwd", "aet", "balance")
+cfg$zonal_monthly <- c("cwd", "aet", "balance")
+```
