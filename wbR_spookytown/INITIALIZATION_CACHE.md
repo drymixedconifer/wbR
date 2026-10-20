@@ -1,0 +1,5 @@
+# Persistent initialization state (development)
+
+The converged state after `base_years` is now cached under `environment_cache/initialization_states/<scientific fingerprint>/baseline_end.rds`. This includes soil, snowpack, and preceding September–December snow summaries. Output variables, output location, and zonal classification do not determine the cache key. Source climate files, model source checksum, scientific parameters and model geometry do. Run `wb_run(cfg)` normally; the model checks for an initialized state after its environment preparation and lapse-rate setup.
+
+A cached state is **not** a cached annual time series: analysis years must still be simulated for new output batches. Existing annual raster stacks are left in place; the run-specific checkpoint directory is separate for each output configuration. Changes to source timestamps/sizes or model code invalidate this cache. Partial baseline state files are atomically written. A first run that explicitly requests baseline raster outputs still calculates them. The cache has not been tested against a real west-wide R execution.
