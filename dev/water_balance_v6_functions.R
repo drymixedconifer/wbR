@@ -2555,13 +2555,14 @@ wb_run_sequence <- function(site, cfg, index, years, initial, stage, mem, grids,
       # A separate two-variable pass keeps the memory bound independent of other outputs.
       dx <- wb_year(mem, grid, p, tmean, state$soil, state$pack, site,
                     monthly = as.integer(1L + 2L), vpd = vpd)
-      for (m in 1:12) {
-        nm <- sprintf("%02d", m)
-        dx[, paste0("balance_m", nm)] <-
-          dx[, paste0("aet_m", nm)] - dx[, paste0("cwd_m", nm)]
-      }
+      # wb_year() returns a fixed-width matrix. Matrix [<- cannot create
+      # additional named columns, so construct a separate derived matrix.
+      months <- sprintf("%02d", 1:12)
+      balance_monthly <- dx[, paste0("aet_m", months), drop = FALSE] -
+        dx[, paste0("cwd_m", months), drop = FALSE]
+      colnames(balance_monthly) <- paste0("balance_m", months)
       zrows[[length(zrows) + 1L]] <- wb_zonal_chunk(
-        dx, "balance", zonal, yr, stage)
+        balance_monthly, "balance", zonal, yr, stage)
       rm(dx); gc(verbose = FALSE)
     }
     if (emit_annual) {
