@@ -224,6 +224,7 @@ cfg <- list(
   snow_t_all = SNOW_T_ALL, rain_t_all = RAIN_T_ALL, melt_mm_per_deg_day = MELT_MM_PER_DEG_DAY,
   melt_radiation_weight = MELT_RADIATION_WEIGHT,
   melt_method = MELT_METHOD, melt_mm_per_mj = MELT_MM_PER_MJ, snow_albedo = SNOW_ALBEDO,
+    snow_cover_demand = SNOW_COVER_DEMAND, snow_cover_min_mm = SNOW_COVER_MIN_MM,
   points_path = POINTS_PATH, points_id_field = POINTS_ID_FIELD, points_neighbourhood = POINTS_NEIGHBOURHOOD,
   write_rasters = WRITE_RASTERS,
   zonal_path = ZONAL_PATH, zonal_id_field = ZONAL_ID_FIELD,

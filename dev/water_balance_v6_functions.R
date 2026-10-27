@@ -159,18 +159,56 @@ wb_daylength <- function(lat_deg) {
 }
 
 wb_latitude_raster <- function(dem) {
-  template <- rast(dem)
-  from <- crs(template)
-  latitude <- app(init(template, "cell"), function(cells) {
-    xy <- xyFromCell(template, as.vector(cells))
-    ll <- terra::project(xy, from, "EPSG:4326")
-    lat <- ll[,2]
-    if (any(!is.finite(lat)) || any(abs(lat) > 90))
-      stop("Could not transform DEM cell centers to valid latitudes.")
-    lat
-  })
-  names(latitude) <- "latitude_degrees"
-  mask(latitude, dem)
+  # IMPORTANT: use the value-bearing DEM, not rast(dem), which can
+  # produce a geometry-only raster and cause an all-NA elevation read.
+  template <- dem
+  if (terra::nlyr(template) != 1L)
+    stop("wb_latitude_raster expects a single-layer DEM.")
+  from <- terra::crs(template)
+  if (!nzchar(from)) stop("DEM has no CRS; cannot calculate latitude.")
+
+  # Disk-backed block processing: no full-grid cell-index raster and no
+  # two-layer DEM/index stack. Match the DEM mask exactly.
+  result <- terra::rast(template)
+  names(result) <- "latitude_degrees"
+  temp <- tempfile(pattern = "wb_lat_", fileext = ".tif")
+  completed <- FALSE
+  on.exit(if (!completed) unlink(temp), add = TRUE)
+  terra::readStart(template)
+  on.exit(terra::readStop(template), add = TRUE)
+  blocks <- terra::writeStart(result, temp, overwrite = TRUE,
+                              wopt = list(datatype = "FLT4S"))
+  valid_total <- 0
+  for (i in seq_len(blocks$n)) {
+    nr <- blocks$nrows[i]
+    first_row <- blocks$row[i]
+    elev <- terra::readValues(template, row = first_row, nrows = nr,
+                              mat = FALSE)
+    lat <- rep(NA_real_, length(elev))
+    valid <- which(is.finite(elev))
+    if (length(valid)) {
+      # Raster cell indices for the CURRENT block, not global raster vectors.
+      offset <- (as.double(first_row) - 1) * terra::ncol(template)
+      ids <- offset + valid
+      xy <- terra::xyFromCell(template, ids)
+      ll <- tryCatch(terra::project(xy, from, "EPSG:4326"),
+                     error = function(e) stop("DEM CRS transformation failed: ", conditionMessage(e)))
+      lat_valid <- ll[, 2L]
+      if (length(lat_valid) != length(valid) ||
+          any(!is.finite(lat_valid)) || any(abs(lat_valid) > 90))
+        stop("Could not transform valid DEM cells to latitudes; verify DEM CRS and extent.")
+      lat[valid] <- lat_valid
+      valid_total <- valid_total + length(valid)
+    }
+    terra::writeValues(result, lat, first_row, nr)
+  }
+  result <- terra::writeStop(result)
+  completed <- TRUE
+  if (!valid_total) stop(
+    "Latitude preparation read no valid elevations despite the DEM passing its upstream ",
+    "validity check. Check that DEM values survive the reader setup."
+  )
+  result
 }
 
 wb_make_12 <- function(x) {
@@ -358,6 +396,8 @@ struct WBYearWorker : public Worker {
   const int melt_method;            // 1 = degree-day (v5.3), 2 = energy: c_T * T + c_R * (1 - snow_albedo) * Rs
   const double melt_rad_factor;     // mm of melt per MJ m-2 of shortwave absorbed by the snow (energy method)
   const double snow_albedo;         // snow surface albedo for the energy method
+  const int snow_cover_mode; // 1: exclude demand beneath snow (default); 0: historical soil demand
+  const double snow_cover_min; // minimum SWE for snow cover (mm)
   const int monthly;                // bitmask of monthly outputs: 1 cwd, 2 aet, 4 pet, 8 water, 16 soil, 32 pack, 64 ppt, 128 snowfall,
                                     //   256 tmean, 512 rs, 1024 rnet, 2048 melt (v5.5), 4096 vpd (v6.0)
   const int mcol0;                  // first monthly output column
@@ -378,7 +418,7 @@ struct WBYearWorker : public Worker {
     const NumericVector declination, const NumericVector month_days, int method,
     double pt_alpha, double albedo, int diag, double snow_t_all, double rain_t_all,
     double melt_factor, double melt_rad_weight, int melt_method, double melt_rad_factor, double snow_albedo,
-    int monthly, int mcol0, NumericMatrix out
+    int snow_cover_mode, double snow_cover_min, int monthly, int mcol0, NumericMatrix out
   ) :
     Pc(Pc), Tc(Tc), Vc(Vc), nrc(nrc), ncc(ncc), rowf(rowf), colf(colf), covered(covered),
     dz(dz), lapse_t(lapse_t), beta_p(beta_p), awcv(awcv), hlv(hlv), soilv(soilv),
@@ -388,7 +428,8 @@ struct WBYearWorker : public Worker {
     wind_fill(wind_fill), aero_scale(aero_scale), keep(keep), declination(declination), month_days(month_days),
     method(method), pt_alpha(pt_alpha), albedo(albedo), diag(diag), snow_t_all(snow_t_all), rain_t_all(rain_t_all),
     melt_factor(melt_factor), melt_rad_weight(melt_rad_weight), melt_method(melt_method),
-    melt_rad_factor(melt_rad_factor), snow_albedo(snow_albedo), monthly(monthly), mcol0(mcol0), out(out) {}
+    melt_rad_factor(melt_rad_factor), snow_albedo(snow_albedo), snow_cover_mode(snow_cover_mode),
+    snow_cover_min(snow_cover_min), monthly(monthly), mcol0(mcol0), out(out) {}
 
   // Bilinear weights of the four coarse cells around (r, c); neighbours outside
   // the grid are dropped. Returns the number of usable neighbours.
@@ -655,7 +696,8 @@ struct WBYearWorker : public Worker {
         }
         melt_potential = std::max(T, 0.0) * melt_factor * rad_scale * nd;
         }
-        double MELT = std::min(pack + SNOW, melt_potential);
+        const double avail_snow = pack + SNOW;
+        double MELT = std::min(avail_snow, melt_potential);
         if (!std::isfinite(MELT) || MELT < 0.0) MELT = 0.0;
         pack = pack + SNOW - MELT;
         if (!std::isfinite(pack) || pack < 0.0) pack = 0.0;
@@ -663,26 +705,35 @@ struct WBYearWorker : public Worker {
         const double W = RAIN + MELT;
 
         // -----------------------------------------------------
+        // Fraction of the month with snow cover. Suppress soil/plant demand
+        // beneath snow when snow_cover_mode=1; retain atmospheric PET output.
+        double cover = 0.0;
+        if (avail_snow >= snow_cover_min && avail_snow > 0.0)
+          cover = melt_potential > avail_snow ? avail_snow / melt_potential : 1.0;
+        if (!std::isfinite(cover)) cover = 0.0;
+        cover = std::max(0.0, std::min(cover, 1.0));
+        const double PET_soil = snow_cover_mode == 1 ? (1.0 - cover) * PET : PET;
+
         // Wet / dry balance
         // -----------------------------------------------------
         double AET = 0.0;
         double DEF = 0.0;
         double RUNOFF = 0.0;
 
-        if ((W - PET) >= 0.0) {
+        if ((W - PET_soil) >= 0.0) {
           // Wet month
-          AET = PET;
-          soil += W - PET;
+          AET = PET_soil;
+          soil += W - PET_soil;
           RUNOFF = std::max(0.0, soil - awc);
           soil = std::max(0.0, std::min(soil, awc));
         } else {
           // Dry month
-          double dSOIL = soil * (1.0 - std::exp((W - PET) / awc));
+          double dSOIL = soil * (1.0 - std::exp((W - PET_soil) / awc));
           if (!std::isfinite(dSOIL) || dSOIL < 0.0) dSOIL = 0.0;
           dSOIL = std::min(dSOIL, soil);
 
           AET = W + dSOIL;
-          AET = std::max(0.0, std::min(AET, PET));
+          AET = std::max(0.0, std::min(AET, PET_soil));
 
           double soil_withdraw = AET - W;
           if (!std::isfinite(soil_withdraw) || soil_withdraw < 0.0) soil_withdraw = 0.0;
@@ -690,7 +741,7 @@ struct WBYearWorker : public Worker {
           soil -= soil_withdraw;
           soil = std::max(0.0, std::min(soil, awc));
 
-          DEF = PET - AET;
+          DEF = PET_soil - AET;
           if (!std::isfinite(DEF) || DEF < 0.0) DEF = 0.0;
         }
 
@@ -718,6 +769,7 @@ struct WBYearWorker : public Worker {
           if (monthly & 2048) { out(i, col + m) = MELT; col += 12; }  // snowmelt, mm
           if (monthly & 4096) { out(i, col + m) = method == 3 ? VPDm[m] : NA_REAL; col += 12; }
           if (monthly & 8192) { out(i, col + m) = RUNOFF; col += 12; } // excess water/runoff (mm)
+          if (monthly & 16384) { out(i, col + m) = cover; col += 12; } // snow-cover fraction
         }
       }
 
@@ -785,6 +837,8 @@ NumericMatrix wb_year_cpp(
     int melt_method,
     double melt_rad_factor,
     double snow_albedo,
+    int snow_cover_mode,
+    double snow_cover_min,
     int monthly
 ) {
 
@@ -828,11 +882,13 @@ NumericMatrix wb_year_cpp(
       !(snow_albedo >= 0.0 && snow_albedo < 1.0))
     stop("Invalid snowmelt settings (melt_method 1 or 2, melt_rad_factor >= 0, snow_albedo in [0, 1)).");
 
+  if ((snow_cover_mode != 0 && snow_cover_mode != 1) || !std::isfinite(snow_cover_min) || snow_cover_min < 0)
+    stop("Invalid snow-cover settings.");
   if (diag < 0 || diag > 2) stop("diag must be 0, 1 or 2.");
-  if (monthly < 0 || monthly > 16383) stop("monthly must be a bitmask in 0..16383.");
+  if (monthly < 0 || monthly > 32767) stop("monthly must be a bitmask in 0..32767.");
   const int mcol0 = diag == 2 ? 16 : (diag == 1 ? 5 : 4);
   int nmonthly = 0;
-  for (int bit = 0; bit < 14; bit++) if (monthly & (1 << bit)) nmonthly++;
+  for (int bit = 0; bit < 15; bit++) if (monthly & (1 << bit)) nmonthly++;
   const int ncol_out = mcol0 + 12 * nmonthly;
   NumericMatrix out(n, ncol_out);
 
@@ -842,7 +898,7 @@ NumericMatrix wb_year_cpp(
       rowf_s, colf_s, covered_s, trans_fill, rh_fill,
       Wc, nrw, ncw, rowf_w, colf_w, covered_w, wind_fill, aero_scale, keep, declination, month_days,
       method, pt_alpha, albedo, diag, snow_t_all, rain_t_all, melt_factor, melt_rad_weight,
-      melt_method, melt_rad_factor, snow_albedo, monthly, mcol0, out
+      melt_method, melt_rad_factor, snow_albedo, snow_cover_mode, snow_cover_min, monthly, mcol0, out
   );
 
   parallelFor(0, n, worker);
@@ -858,9 +914,9 @@ NumericMatrix wb_year_cpp(
     }
   }
   if (monthly) {
-    const char* labels[14] = {"cwd", "aet", "pet", "water", "soil", "pack", "ppt", "snowfall", "tmean", "rs", "rnet", "melt", "vpd", "runoff"};
+    const char* labels[15] = {"cwd", "aet", "pet", "water", "soil", "pack", "ppt", "snowfall", "tmean", "rs", "rnet", "melt", "vpd", "runoff", "scover"};
     int col = mcol0;
-    for (int bit = 0; bit < 14; bit++) {
+    for (int bit = 0; bit < 15; bit++) {
       if (!(monthly & (1 << bit))) continue;
       for (int m = 0; m < 12; m++) {
         char buf[16];
@@ -988,6 +1044,10 @@ wb_memory_site <- function(site, cfg, keep_cells = NULL) {
        xy = xyFromCell(site$dem, cells), awc = awc[cells],
        hl = pick(site$HL), latitude = pick(site$latitude), elevation = pick(site$dem),
        lapse_t = slopes(site$lapse_t), beta_p = slopes(site$beta_p))
+  bad_lat <- !is.finite(mem$latitude) | abs(mem$latitude) > 90
+  if (any(bad_lat)) stop(sprintf(
+    "Latitude missing/invalid for %s of %s modeled AWC cells; check DEM/AWC masks and CRS before spin-up.",
+    format(sum(bad_lat), big.mark = ","), format(mem$n, big.mark = ",")))
   rm(awc); gc(verbose = FALSE)
   old <- wb_enter("Computing clear-sky radiation by month"); on.exit(.wb_log$context <- old, add = TRUE)
   cat("Computing monthly clear-sky radiation for ", format(mem$n, big.mark = ","), " cells...\n", sep = "")
@@ -1152,7 +1212,7 @@ wb_year <- function(mem, grid, ppt, tmean, soil, pack, site, awc = mem$awc,
               site$month_days, method_code, site$pt_alpha,
               site$surface_albedo, as.integer(diag), site$snow_t_all, site$rain_t_all,
               site$melt_factor, site$melt_rad_weight, site$melt_method, site$melt_rad_factor,
-              site$snow_albedo, as.integer(monthly))
+              site$snow_albedo, site$snow_cover_mode, site$snow_cover_min, as.integer(monthly))
 }
 
 # Per-cell values back onto the model grid (one layer per column). Layers are
@@ -1331,6 +1391,13 @@ wb_validate <- function(cfg) {
   if (cfg$pet_method == "hamon" && cfg$melt_method == "degree_day") {
     cfg$static_types <- character(); cfg$climate_types <- c("ppt", "tmean")
   }
+  # Snow-covered fraction of month suppresses soil demand by default (v6.1).
+  if (is.null(cfg$snow_cover_demand)) cfg$snow_cover_demand <- "exclude"
+  if (length(cfg$snow_cover_demand) != 1L || !cfg$snow_cover_demand %in% c("exclude", "soil"))
+    stop('snow_cover_demand must be "exclude" or "soil".')
+  if (is.null(cfg$snow_cover_min_mm)) cfg$snow_cover_min_mm <- 10
+  if (length(cfg$snow_cover_min_mm) != 1L || !is.finite(cfg$snow_cover_min_mm) || cfg$snow_cover_min_mm < 0)
+    stop("snow_cover_min_mm must be a finite nonnegative number.")
   # ---- Monthly output (v5.2) ----
   vars <- wb_monthly_vars
   if (is.null(cfg$monthly_output) || identical(cfg$monthly_output, FALSE) || !length(cfg$monthly_output)) cfg$monthly_output <- character()
@@ -1711,6 +1778,8 @@ wb_prepare_site_uncached <- function(cfg, job) {
        melt_factor = cfg$melt_mm_per_deg_day, melt_rad_weight = cfg$melt_radiation_weight,
        melt_method = if (cfg$melt_method == "energy") 2L else 1L, melt_rad_factor = cfg$melt_mm_per_mj,
        snow_albedo = cfg$snow_albedo,
+       snow_cover_mode = if (cfg$snow_cover_demand == "exclude") 1L else 0L,
+       snow_cover_min = cfg$snow_cover_min_mm,
        solar_declination = 0.409 * sin(2 * pi * (c(15,45,74,105,135,166,196,227,258,288,319,349) - 80) / 365),
        month_days = c(31,28,31,30,31,30,31,31,30,31,30,31))
 }
@@ -2125,6 +2194,8 @@ wb_spinup <- function(site, cfg, mem, grids) {
   converged <- FALSE
   for (i in seq_len(cfg$spinup_max_iter)) {
     x <- wb_year(mem, grid, site$normals$ppt, site$normals$tmean, soil, pack, site, vpd = site$normals$vpd)
+    if (all(is.na(x[, "soil_end"])) || all(is.na(x[, "pack_end"])))
+      stop("Spin-up returned all-NA model states. Verify PRISM coverage, AWC, lapse fields, and latitude; not a snow convergence result.")
     ds <- wb_change_stats(soil, x[, "soil_end"], cfg$soil_tol_mm)
     dp <- wb_change_stats(pack, x[, "pack_end"], cfg$pack_tol_mm)
     records[[i]] <- data.frame(iteration = i, soil_mean_mm = ds$mean, soil_max_mm = ds$max,
@@ -2239,9 +2310,9 @@ wb_pet_check <- function(site, cfg, mem, grids, spin) {
 # 12 layers each (mm; soil and pack are end-of-month states; ppt is the
 # downscaled monthly precipitation and snowfall its snow share; vpd is the
 # downscaled vapour-pressure deficit in kPa, Penman-Monteith runs only).
-wb_monthly_vars <- c("cwd", "aet", "pet", "water", "soil", "pack", "ppt", "snowfall", "tmean", "rs", "rnet", "melt", "vpd", "runoff")
+wb_monthly_vars <- c("cwd", "aet", "pet", "water", "soil", "pack", "ppt", "snowfall", "tmean", "rs", "rnet", "melt", "vpd", "runoff", "scover")
 wb_monthly_units <- c(cwd = "mm", aet = "mm", pet = "mm", water = "mm", soil = "mm", pack = "mm", ppt = "mm", snowfall = "mm",
-                      tmean = "C", rs = "MJm2d", rnet = "MJm2d", melt = "mm", vpd = "kPa", runoff = "mm")
+                      tmean = "C", rs = "MJm2d", rnet = "MJm2d", melt = "mm", vpd = "kPa", runoff = "mm", scover = "frac")
 wb_monthly_paths <- function(cfg, vars, year) {
   file.path(cfg$output_root, "monthly", paste0(toupper(vars), "_monthly_", wb_monthly_units[vars], "_", year, ".tif"))
 }
@@ -2419,7 +2490,7 @@ wb_initialization_cache <- function(cfg, index, site, mem) {
     "rad_diffuse_fraction", "rad_step_minutes", "cloud_transmittance",
     "humidity_source", "snow_t_all", "rain_t_all", "melt_method",
     "melt_mm_per_deg_day", "melt_mm_per_mj", "snow_albedo",
-    "melt_radiation_weight", "code_md5"
+    "melt_radiation_weight", "snow_cover_demand", "snow_cover_min_mm", "code_md5"
   )
   historical <- index[is.na(index$year) | index$is_normal |
                         (!is.na(index$year) & index$year %in% cfg$base_years), , drop = FALSE]
@@ -2651,7 +2722,7 @@ wb_main_impl <- function(cfg) {
       points <- wb_points_rows(points, mem, cfg)
       cat("Points with modelled cells:", nrow(points$pts), if (!cfg$write_rasters) "(points-only run: no rasters will be written)" else "", "\n")
     }
-    zonal <- if (is.null(cfg$zonal_path)) NULL else wb_zonal_prepare(cfg$zonal_path, cfg$zonal_id_field, mem)
+    zonal <- if (is.null(cfg$zonal_path)) NULL else wb_zonal_prepare_cached(cfg$zonal_path, cfg$zonal_id_field, mem, cfg)
     write.csv(mem$rad_summary, file.path(site$out_dir, "radiation_summary.csv"), row.names = FALSE)
     cat("Clear-sky radiation on slopes, monthly mean (MJ m-2 d-1):",
         paste(round(mem$rad_summary$clear_sky_slope_MJ_m2_d, 1), collapse = " "), "\n")
@@ -2826,6 +2897,65 @@ wb_prepare_site <- function(cfg, job) {
   site
 }
 
+# Persistent zone-to-model-cell mapping. Output selections, years, and PET method
+# do not enter the key; changes to source geometry or grid/mask do.
+wb_zonal_prepare_cached <- function(zones, id_field, mem, cfg) {
+  # In-memory zone objects have no reliable persistent identity: prepare normally.
+  if (!is.character(zones) || length(zones) != 1L || !file.exists(path.expand(zones)))
+    return(wb_zonal_prepare(zones, id_field, mem))
+  source_path <- normalizePath(path.expand(zones), mustWork = TRUE)
+  # Ordinary local paths and shapefile sidecars are included in the signature.
+  signature <- wb_environment_input_signature(source_path)
+  template <- mem$template
+  geometry <- list(crs = terra::crs(template), extent = as.vector(terra::ext(template)),
+                   resolution = terra::res(template), nrow = terra::nrow(template),
+                   ncol = terra::ncol(template))
+  root <- cfg$environment_cache
+  if (is.null(root) || !length(root) || !nzchar(root))
+    root <- file.path(dirname(normalizePath(cfg$dem_path, mustWork = TRUE)),
+                      ".wbr_prepared_environment")
+  dest <- file.path(path.expand(root), "zonal_mappings")
+  dir.create(dest, recursive = TRUE, showWarnings = FALSE)
+  # Hash the actual engine-cell ordering. Identical grid geometry alone does not
+  # guarantee identical modeled cells, particularly with changes to soil masks.
+  mask_file <- tempfile("wb_zone_cells_", tmpdir = dest, fileext = ".bin")
+  on.exit(unlink(mask_file), add = TRUE)
+  con <- file(mask_file, "wb")
+  writeBin(as.double(mem$cells), con, size = 8L)
+  close(con)
+  mask_md5 <- unname(tools::md5sum(mask_file))
+  payload <- list(version = 1L, source = signature, id_field = id_field,
+                  geometry = geometry, mask_md5 = mask_md5,
+                  assignment = "terra_cell_center_last_polygon_wins")
+  keyfile <- tempfile("wb_zone_key_", tmpdir = dest, fileext = ".rds")
+  on.exit(unlink(keyfile), add = TRUE)
+  saveRDS(payload, keyfile, version = 2)
+  key <- unname(tools::md5sum(keyfile))
+  path <- file.path(dest, paste0(key, ".rds"))
+  if (file.exists(path)) {
+    cached <- tryCatch(readRDS(path), error = function(e) NULL)
+    if (is.list(cached) && identical(cached$key, key) &&
+        is.list(cached$mapping) && length(cached$mapping$group) == mem$n &&
+        is.data.frame(cached$mapping$meta) &&
+        all(c("zone_id", "zone_label", "n_zone_cells") %in% names(cached$mapping$meta)) &&
+        sum(cached$mapping$meta$n_zone_cells) == sum(!is.na(cached$mapping$group))) {
+      cat("Reusing zonal cell mapping: ", path, "\n", sep = "")
+      return(cached$mapping)
+    }
+    warning("Zonal mapping cache failed validation; rebuilding: ", path)
+  }
+  mapping <- wb_zonal_prepare(zones, id_field, mem)
+  tmp <- tempfile("wb_zone_mapping_", tmpdir = dest, fileext = ".rds")
+  on.exit(unlink(tmp), add = TRUE)
+  saveRDS(list(key = key, mapping = mapping), tmp, compress = TRUE)
+  # Publish only complete mappings. Another process may already have written
+  # an equivalent mapping; renaming safely replaces that cache entry.
+  if (file.exists(path)) unlink(path)
+  if (!file.rename(tmp, path)) warning("Could not retain zonal cache: ", path)
+  else cat("Cached zonal cell mapping: ", path, "\n", sep = "")
+  mapping
+}
+
 wb_zonal_prepare <- function(zones, id_field, mem) {
   if (is.character(zones)) zones <- if (tolower(tools::file_ext(zones)) %in%
       c("tif", "tiff", "vrt", "grd", "img", "nc")) terra::rast(zones) else terra::vect(zones)
@@ -2904,21 +3034,19 @@ wb_zonal_chunk <- function(x, vars, zonal, year, stage) {
     spatial_var[many] <- pmax(0, (sumsq[many] - sums[many]^2 / counts[many]) / (counts[many] - 1L))
     spatial_sd <- sqrt(spatial_var)
     spatial_cv <- ifelse(is.finite(mn) & abs(mn) > 0, spatial_sd / abs(mn), NA_real_)
-    # Within-zone empirical percentiles of individual modeled cells for this month.
-    # Match the NA semantics of mean/sd; do not confuse these with temporal quantiles.
-    spatial_q10 <- spatial_q90 <- rep(NA_real_, ng)
+    # Exact spatial extrema over valid modeled cells, without sorting or quantiles.
+    spatial_min <- spatial_max <- rep(NA_real_, ng)
     if (length(valid)) {
-      by_zone <- split(value[valid], group[valid])
-      q <- lapply(by_zone, stats::quantile, probs = c(0.10, 0.90),
-                  names = FALSE, na.rm = TRUE, type = 7)
-      idx <- as.integer(names(q))
-      spatial_q10[idx] <- vapply(q, `[`, numeric(1), 1L)
-      spatial_q90[idx] <- vapply(q, `[`, numeric(1), 2L)
+      # Group-wise extrema; independent of zone geometry and order.
+      extrema <- lapply(split(value[valid], group[valid]), range)
+      idx <- as.integer(names(extrema))
+      spatial_min[idx] <- vapply(extrema, `[`, numeric(1), 1L)
+      spatial_max[idx] <- vapply(extrema, `[`, numeric(1), 2L)
     }
     k <- k + 1L
     out[[k]] <- data.frame(zone_id = zonal$meta$zone_id, zone_label = zonal$meta$zone_label,
       stage = stage, year = year, month = m, variable = v,
-      mean = mn, spatial_q10 = spatial_q10, spatial_q90 = spatial_q90,
+      mean = mn, spatial_min = spatial_min, spatial_max = spatial_max,
       spatial_sd = spatial_sd, spatial_variance = spatial_var, spatial_cv = spatial_cv,
       n_cells = counts, n_zone_cells = zonal$meta$n_zone_cells,
       coverage = ifelse(zonal$meta$n_zone_cells > 0, counts / zonal$meta$n_zone_cells, NA_real_))
@@ -2955,8 +3083,10 @@ wb_zonal_climatology <- function(monthly) {
       month = x$month[1], variable = x$variable[1],
       mean = avg_valid(x$mean), temporal_sd = sd_valid(x$mean),
       temporal_variance = if (sum(ok) > 1L) stats::var(x$mean[ok]) else NA_real_,
-      mean_spatial_q10 = avg_valid(x$spatial_q10),
-      mean_spatial_q90 = avg_valid(x$spatial_q90),
+      temporal_min = if (any(ok)) min(x$mean[ok]) else NA_real_,
+      temporal_max = if (any(ok)) max(x$mean[ok]) else NA_real_,
+      mean_spatial_min = avg_valid(x$spatial_min),
+      mean_spatial_max = avg_valid(x$spatial_max),
       mean_spatial_sd = avg_valid(x$spatial_sd),
       mean_spatial_variance = avg_valid(x$spatial_variance),
       mean_spatial_cv = avg_valid(x$spatial_cv),
@@ -2992,11 +3122,11 @@ wb_zonal_export <- function(cfg, site, stages, zonal) {
     "n_zone_cells is the number of modeled cells assigned to each zone.",
     "n_cells is the number of valid cells; coverage is their ratio.",
     "Monthly spatial_sd and spatial_variance are sample dispersion across valid modeled cells within each zone/month (n-1 denominator).",
-    "Monthly spatial_q10 and spatial_q90 are exact type-7 cell-value percentiles within each zone/month/year (valid cells only).",
+    "Monthly spatial_min and spatial_max are the extrema across valid modeled cells within each zone/month/year.",
     "Monthly spatial_cv is spatial_sd / abs(mean); undefined where zone mean is zero.",
-    "Climatology mean_spatial_q10 and mean_spatial_q90 average the annual spatial percentiles; they are NOT pooled space-time quantiles.",
+    "Climatology mean_spatial_min and mean_spatial_max average the annual spatial extrema (mean spatial envelope, not overall space-time extrema).",
     "zonal_monthly_climatology.csv uses analysis years only: mean is the average monthly zone mean across years.",
-    "temporal_sd/temporal_variance in climatology describe interannual variability; mean_spatial_sd and mean_spatial_variance describe spatial variability.",
+    "temporal_min/temporal_max are extrema of yearly monthly zone means for a calendar month; temporal_sd/temporal_variance describe interannual variability. Mean spatial extrema/dispersion describe within-zone spatial variation.",
     "Annual zonal spatial variance is not inferred from monthly variances, because cross-month cell covariance is needed.",
     "Polygons use cell-center assignment; overlapping polygons use last-feature assignment.",
     "Zones are evaluated only on modeled cells. Points use the containing cell.",

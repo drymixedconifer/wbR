@@ -160,6 +160,8 @@
   # Convergence requires mean and fraction criteria only; snow maxima are reported separately.
   # Maxima, fractions, invalid-cell counts, and final residual maps are saved.
   # 0 requires every compared cell to meet the tolerance; 100 gives mean-only logic.
+  SNOW_COVER_DEMAND <- "exclude"  # v6.1 default: suppress soil demand beneath snow
+  SNOW_COVER_MIN_MM <- 10       # mm SWE threshold
   # One two-layer SNOW_spinup_baseline_<years>.tif preserves snowpack and signed change (mm SWE).
   SPINUP_ACTION <- "stop"       # "warn": continue with explicit failed status; "stop": stop.
   # If not converged, inspect spinup_diagnostics.csv and spinup_final_change_mm.tif.
@@ -222,6 +224,7 @@
     snow_t_all = SNOW_T_ALL, rain_t_all = RAIN_T_ALL, melt_mm_per_deg_day = MELT_MM_PER_DEG_DAY,
     melt_radiation_weight = MELT_RADIATION_WEIGHT,
     melt_method = MELT_METHOD, melt_mm_per_mj = MELT_MM_PER_MJ, snow_albedo = SNOW_ALBEDO,
+    snow_cover_demand = SNOW_COVER_DEMAND, snow_cover_min_mm = SNOW_COVER_MIN_MM,
     points_path = POINTS_PATH, points_id_field = POINTS_ID_FIELD, points_neighbourhood = POINTS_NEIGHBOURHOOD,
     write_rasters = WRITE_RASTERS,
     zonal_path = ZONAL_PATH, zonal_id_field = ZONAL_ID_FIELD,
