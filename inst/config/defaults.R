@@ -74,7 +74,8 @@ MELT_MM_PER_DEG_DAY <- 2.3         # mm per C per day. Energy method: the temper
 MELT_MM_PER_MJ <- 2.3              # Energy method only: mm of melt per MJ m-2 of net radiation (fitted 2.26; 3.0 = complete conversion).
 SNOW_ALBEDO <- 0.77                # Energy method only: snow-surface albedo (fitted 0.77; fresh 0.8-0.9, old/melting 0.5-0.6).
 MELT_RADIATION_WEIGHT <- 0.6       # Degree-day method only: share of the melt factor scaled with slope radiation (0 = plain 5.2 degree-day).
-
+SNOW_COVER_DEMAND <- "exclude"
+SNOW_COVER_MIN_MM <- 10
 # ---- Points (new in 5.5) ----
 # Monthly and annual values at a set of points, written as CSV (<OUTPUT_ROOT>/points/points_monthly.csv and
 # points_annual.csv, with a README). Points come from a CSV with longitude/latitude columns (WGS84 decimal
