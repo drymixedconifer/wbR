@@ -2,7 +2,7 @@
 
 ### Spatial water and energy balance modeling in R
 
-**What up with water. Also energy.**
+**Where water falls, where it goes, and where it falls short.**
 
 [Source code](https://github.com/drymixedconifer/wbR) · [Issues](https://github.com/drymixedconifer/wbR/issues) · MIT License
 
