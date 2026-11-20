@@ -37,7 +37,17 @@ fut_find_nc <- function(fut, model) {
                             "; found ", length(f), ". Files are named <MODEL>_<scenario>_monthly_<first>-<last>_west.nc.")
   f
 }
+fut_nc_units <- function(path, variable) {
+  nc <- ncdf4::nc_open(path)
+  on.exit(ncdf4::nc_close(nc))
 
+  att <- ncdf4::ncatt_get(nc, variable, "units")
+
+  if (!isTRUE(att$hasatt))
+    stop("Missing units attribute for ", variable)
+
+  att$value
+}
 # Open the three variables, check units and the monthly calendar, put the grid on -180..180 and crop to the site.
 fut_open <- function(path, model, site, cfg) {
   old <- wb_enter("Opening LOCA2 file", "not applicable", path); on.exit(.wb_log$context <- old, add = TRUE)
@@ -45,7 +55,7 @@ fut_open <- function(path, model, site, cfg) {
   h <- list(path = path, model = model)
   for (k in names(vars)) {
     r <- wb_step("Opening LOCA2 variable", path, rast(path, subds = vars[[k]]))
-    u <- unique(units(r))
+    u <- fut_nc_units(path, vars[[k]])
     if (length(u) != 1L || !identical(u, fut_units[[vars[[k]]]]))
       stop("LOCA2 variable ", vars[[k]], " should be in ", fut_units[[vars[[k]]]], " but the file says '", paste(u, collapse = "', '"), "': ", path)
     tm <- time(r)
