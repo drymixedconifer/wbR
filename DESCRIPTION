@@ -16,6 +16,6 @@ BugReports: https://github.com/drymixedconifer/wbR/issues
 License: MIT + file LICENSE
 Encoding: UTF-8
 Depends: R (>= 4.2.0)
-Imports: terra, prism, Rcpp, RcppParallel
+Imports: terra, prism, Rcpp, RcppParallel, ncdf4
 Suggests: testthat
 SystemRequirements: C++11 toolchain for runtime Rcpp compilation
