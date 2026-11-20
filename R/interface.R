@@ -41,7 +41,8 @@ wb_config <- function(engine_path = NULL, advanced = FALSE) {
   defaults <- .wbr_config_defaults(.wbr_engine_path(engine_path))
   if (isTRUE(advanced)) return(defaults)
   keys <- c(
-    'dem_path','awc_path','aoi_path','aoi_bbox','prism_root','prism_mode',
+    'dem_path','awc_path','awc_constant_mm','awc_depth_path','awc_depth_units',
+    'awc_resample','awc_units','awc_source','awc_version','aoi_path','aoi_bbox','prism_root','prism_mode',
     'prism_buffer_km','output_root','base_years','years_annual',
     'months_out','dem_aggregate_fact','pet_method','wind_path',
     'outputs_to_write','write_rasters','monthly_output','zonal_path',
@@ -64,8 +65,6 @@ wb_config <- function(engine_path = NULL, advanced = FALSE) {
 wb_run <- function(config, engine_path = NULL) {
   if (!is.list(config)) stop("config must be a named list from wb_config().")
   path <- .wbr_engine_path(engine_path)
-  if ('analysis_initialization' %in% names(config))
-    stop('analysis_initialization has been removed: analysis always follows the baseline state.')
   defaults <- .wbr_config_defaults(path)
   unknown <- setdiff(names(config), names(defaults))
   if (length(unknown)) stop('Unknown wbR configuration setting(s): ', paste(unknown, collapse=', '))

@@ -1,32 +1,19 @@
-##############################################
-##############################################
-############### Functions to #################
-######## create water balance rasters ########
-##############################################
-##############################################
+#################################################################
+## ======== Functions to create water balance rasters ======== ##
+#################################################################
 
-# Companion to water_balance_v6.0.R. Keep these two R files together.
+# This is the companion to water_balance_v6.3.R. Keep these two R files together. v6.3 adds a startup check that the PRISM cache files are actually on disk (PRISM_CHECK_RESIDENT: cloud-evicted placeholders stop the run before spin-up, not in the year loop) and the soil-input options (AWC_DEPTH_PATH, AWC_RESAMPLE, AWC_SOURCE/AWC_VERSION, mm_per_m units); the water balance is unchanged from 6.1.  This file only defines functions.  Sourcing it does not launch the analysis.
 # C++ is embedded below: no separate .cpp file is needed.
 # Dependencies: terra, prism, Rcpp, RcppParallel; an R-compatible C++ compiler.
-# This file defines functions; sourcing it does not launch the analysis.
 
 # Some notes
-#  * Radiation. The single McCune-Keon heat-load scalar of Hamon is replaced by a 12-month clear-sky shortwave radiation term computed for every cell from its DEM slope, aspect, latitude and elevation (direct beam integrated over the day on the tilted surface, isotropic diffuse scaled by sky view, terrain-reflected diffuse). No horizon shading yet; that may come later in a fine-resolution option. Heat load is still computed and reported, and is still used by the optional Hamon method.
-#  * PET. Priestley-Taylor (default) driven by that radiation, PRISM monthly cloud-transmittance normals (soltrans) and PRISM dew-point normals (tdmean) for the longwave term; or Hamon (PET_METHOD = "hamon"), which reproduces v4.
+#  * Radiation. A 12-month clear-sky shortwave radiation term is computed for every cell from its DEM slope, aspect, latitude and elevation (direct beam integrated over the day on the tilted surface, isotropic diffuse scaled by sky view, terrain-reflected diffuse). We do not implement a hillshading correction—that may be a useful improvement, particularly at fine resolutions. Heat load index (McCune and Keon) is computed and reported, but only used by the optional Hamon method.
+#  * PET. The Priestley-Taylor and Penmam-Monteith options are driven by  radiation, PRISM monthly cloud-transmittance normals (soltrans) and PRISM dew-point normals (tdmean) for the longwave term.
 #  * Static normals. soltrans and tdmean are 1991-2020 monthly normals, applied every year; each can be replaced by a constant (see the driver).
 #  * PET self-check. Optionally writes Hamon vs Priestley-Taylor monthly PET over the normals so a new study area can be sanity-checked.
 #  * Memory. The per-cell monthly radiation table adds 12 doubles per modeled cell (about 1.9 GB for the 11 western states at 400 m).
-# v5.5: points (POINTS_PATH): monthly and annual values at user points written as CSV, from a full run or, with WRITE_RASTERS = FALSE, from a run on the point cells only. Four more monthly variables: tmean, rs, rnet, melt.
-#    Snow defaults re-fitted to SNOTEL station-months (SNOW_T_ALL -6, RAIN_T_ALL 10, energy melt 2.3 mm/C/day + 2.3 mm/MJ, snow albedo 0.77); no engine change.
+#    Snow defaults were re-fitted to SNOTEL station-months (SNOW_T_ALL -6, RAIN_T_ALL 10, energy melt 2.3 mm/C/day + 2.3 mm/MJ, snow albedo 0.77).
 #    Monthly variables are written in chunks (MONTHLY_CHUNK) so memory does not grow with the number requested; the year is recomputed per chunk with identical results.
-# v6.0: Penman-Monteith PET (PET_METHOD = "penman_monteith", the default). The radiation term is the one Priestley-Taylor
-#    uses (clear-sky on the slope x PRISM transmittance normal, FAO-56 longwave with the dew-point normal) with alpha 1 and the
-#    wind-dependent denominator; the aerodynamic term uses PRISM monthly vapour-pressure deficit ((vpdmax + vpdmin)/2, downloaded
-#    like ppt and tmean, 1948-2025 plus the 1991-2020 normals for spin-up) downscaled to each cell by conserving relative
-#    humidity through the temperature lapse, and a static 2 m wind climatology (WIND_PATH, 12 monthly layers on any grid) or a
-#    constant (WIND_CONSTANT). AERO_SCALE multiplies the aerodynamic term (1 = FAO-56 as written). "priestley_taylor" reproduces
-#    5.5 exactly and "hamon" 4.0; the three share one radiation chain. New monthly variable vpd (kPa). The transmittance and
-#    dew-point normals are now prepared under every PET method, so the energy melt option is defined under Hamon too.
 
 # Context follows nested processing calls, including lazy raster reads.
 .wb_log <- new.env(parent = emptyenv())
@@ -159,56 +146,18 @@ wb_daylength <- function(lat_deg) {
 }
 
 wb_latitude_raster <- function(dem) {
-  # IMPORTANT: use the value-bearing DEM, not rast(dem), which can
-  # produce a geometry-only raster and cause an all-NA elevation read.
-  template <- dem
-  if (terra::nlyr(template) != 1L)
-    stop("wb_latitude_raster expects a single-layer DEM.")
-  from <- terra::crs(template)
-  if (!nzchar(from)) stop("DEM has no CRS; cannot calculate latitude.")
-
-  # Disk-backed block processing: no full-grid cell-index raster and no
-  # two-layer DEM/index stack. Match the DEM mask exactly.
-  result <- terra::rast(template)
-  names(result) <- "latitude_degrees"
-  temp <- tempfile(pattern = "wb_lat_", fileext = ".tif")
-  completed <- FALSE
-  on.exit(if (!completed) unlink(temp), add = TRUE)
-  terra::readStart(template)
-  on.exit(terra::readStop(template), add = TRUE)
-  blocks <- terra::writeStart(result, temp, overwrite = TRUE,
-                              wopt = list(datatype = "FLT4S"))
-  valid_total <- 0
-  for (i in seq_len(blocks$n)) {
-    nr <- blocks$nrows[i]
-    first_row <- blocks$row[i]
-    elev <- terra::readValues(template, row = first_row, nrows = nr,
-                              mat = FALSE)
-    lat <- rep(NA_real_, length(elev))
-    valid <- which(is.finite(elev))
-    if (length(valid)) {
-      # Raster cell indices for the CURRENT block, not global raster vectors.
-      offset <- (as.double(first_row) - 1) * terra::ncol(template)
-      ids <- offset + valid
-      xy <- terra::xyFromCell(template, ids)
-      ll <- tryCatch(terra::project(xy, from, "EPSG:4326"),
-                     error = function(e) stop("DEM CRS transformation failed: ", conditionMessage(e)))
-      lat_valid <- ll[, 2L]
-      if (length(lat_valid) != length(valid) ||
-          any(!is.finite(lat_valid)) || any(abs(lat_valid) > 90))
-        stop("Could not transform valid DEM cells to latitudes; verify DEM CRS and extent.")
-      lat[valid] <- lat_valid
-      valid_total <- valid_total + length(valid)
-    }
-    terra::writeValues(result, lat, first_row, nr)
-  }
-  result <- terra::writeStop(result)
-  completed <- TRUE
-  if (!valid_total) stop(
-    "Latitude preparation read no valid elevations despite the DEM passing its upstream ",
-    "validity check. Check that DEM values survive the reader setup."
-  )
-  result
+  template <- rast(dem)
+  from <- crs(template)
+  latitude <- app(init(template, "cell"), function(cells) {
+    xy <- xyFromCell(template, as.vector(cells))
+    ll <- terra::project(xy, from, "EPSG:4326")
+    lat <- ll[,2]
+    if (any(!is.finite(lat)) || any(abs(lat) > 90))
+      stop("Could not transform DEM cell centers to valid latitudes.")
+    lat
+  })
+  names(latitude) <- "latitude_degrees"
+  mask(latitude, dem)
 }
 
 wb_make_12 <- function(x) {
@@ -396,10 +345,12 @@ struct WBYearWorker : public Worker {
   const int melt_method;            // 1 = degree-day (v5.3), 2 = energy: c_T * T + c_R * (1 - snow_albedo) * Rs
   const double melt_rad_factor;     // mm of melt per MJ m-2 of shortwave absorbed by the snow (energy method)
   const double snow_albedo;         // snow surface albedo for the energy method
-  const int snow_cover_mode; // 1: exclude demand beneath snow (default); 0: historical soil demand
-  const double snow_cover_min; // minimum SWE for snow cover (mm)
+  // Demand under snow (v6.1)
+  const int snow_cover_mode;        // 0 = "soil": demand always drawn from the soil (v4.0-6.0); 1 = "exclude": the
+                                    //   snow-covered share of the month's demand is neither taken from the soil nor counted as deficit
+  const double snow_cover_min;      // mm SWE: snow available in the month below this does not count as cover
   const int monthly;                // bitmask of monthly outputs: 1 cwd, 2 aet, 4 pet, 8 water, 16 soil, 32 pack, 64 ppt, 128 snowfall,
-                                    //   256 tmean, 512 rs, 1024 rnet, 2048 melt (v5.5), 4096 vpd (v6.0)
+                                    //   256 tmean, 512 rs, 1024 rnet, 2048 melt (v5.5), 4096 vpd (v6.0), 8192 scover (v6.1)
   const int mcol0;                  // first monthly output column
 
   RMatrix<double> out;
@@ -705,8 +656,16 @@ struct WBYearWorker : public Worker {
         const double W = RAIN + MELT;
 
         // -----------------------------------------------------
-        // Fraction of the month with snow cover. Suppress soil/plant demand
-        // beneath snow when snow_cover_mode=1; retain atmospheric PET output.
+        // Snow cover and the demand that reaches the soil (v6.1)
+        // -----------------------------------------------------
+        // Share of the month the ground is under snow: 1 when snow outlasts the month's melt
+        // potential, otherwise the fraction of the month needed to melt what was available
+        // (available / potential), and 0 when less than snow_cover_min is available. Under
+        // "exclude", only the snow-free share of the month's demand is taken from the soil or
+        // counted as deficit: a snowpack is not drawn down by evaporation from the soil beneath
+        // it, and there is no plant water deficit under snow. Reported PET stays the atmospheric
+        // demand, so CWD + AET = (1 - cover) x PET in snow months. "soil" keeps the 4.0-6.0
+        // bookkeeping, in which demand under snow was drawn from the soil.
         double cover = 0.0;
         if (avail_snow >= snow_cover_min && avail_snow > 0.0)
           cover = melt_potential > avail_snow ? avail_snow / melt_potential : 1.0;
@@ -714,17 +673,16 @@ struct WBYearWorker : public Worker {
         cover = std::max(0.0, std::min(cover, 1.0));
         const double PET_soil = snow_cover_mode == 1 ? (1.0 - cover) * PET : PET;
 
+        // -----------------------------------------------------
         // Wet / dry balance
         // -----------------------------------------------------
         double AET = 0.0;
         double DEF = 0.0;
-        double RUNOFF = 0.0;
 
         if ((W - PET_soil) >= 0.0) {
           // Wet month
           AET = PET_soil;
           soil += W - PET_soil;
-          RUNOFF = std::max(0.0, soil - awc);
           soil = std::max(0.0, std::min(soil, awc));
         } else {
           // Dry month
@@ -767,9 +725,8 @@ struct WBYearWorker : public Worker {
           if (monthly & 512) { out(i, col + m) = Rs;   col += 12; }   // incoming shortwave on the slope, MJ m-2 d-1
           if (monthly & 1024) { out(i, col + m) = Rn_snow; col += 12; } // net radiation at a snow surface, MJ m-2 d-1
           if (monthly & 2048) { out(i, col + m) = MELT; col += 12; }  // snowmelt, mm
-          if (monthly & 4096) { out(i, col + m) = method == 3 ? VPDm[m] : NA_REAL; col += 12; }
-          if (monthly & 8192) { out(i, col + m) = RUNOFF; col += 12; } // excess water/runoff (mm)
-          if (monthly & 16384) { out(i, col + m) = cover; col += 12; } // snow-cover fraction
+          if (monthly & 4096) { out(i, col + m) = method == 3 ? VPDm[m] : NA_REAL; col += 12; } // vapour-pressure deficit, kPa (v6.0)
+          if (monthly & 8192) { out(i, col + m) = cover; }                           // snow-covered share of the month, 0-1 (v6.1)
         }
       }
 
@@ -881,14 +838,14 @@ NumericMatrix wb_year_cpp(
   if ((melt_method != 1 && melt_method != 2) || !(melt_rad_factor >= 0.0) ||
       !(snow_albedo >= 0.0 && snow_albedo < 1.0))
     stop("Invalid snowmelt settings (melt_method 1 or 2, melt_rad_factor >= 0, snow_albedo in [0, 1)).");
+  if ((snow_cover_mode != 0 && snow_cover_mode != 1) || !(snow_cover_min >= 0.0))
+    stop("Invalid snow-cover settings (snow_cover_mode 0 or 1, snow_cover_min >= 0).");
 
-  if ((snow_cover_mode != 0 && snow_cover_mode != 1) || !std::isfinite(snow_cover_min) || snow_cover_min < 0)
-    stop("Invalid snow-cover settings.");
   if (diag < 0 || diag > 2) stop("diag must be 0, 1 or 2.");
-  if (monthly < 0 || monthly > 32767) stop("monthly must be a bitmask in 0..32767.");
+  if (monthly < 0 || monthly > 16383) stop("monthly must be a bitmask in 0..16383.");
   const int mcol0 = diag == 2 ? 16 : (diag == 1 ? 5 : 4);
   int nmonthly = 0;
-  for (int bit = 0; bit < 15; bit++) if (monthly & (1 << bit)) nmonthly++;
+  for (int bit = 0; bit < 14; bit++) if (monthly & (1 << bit)) nmonthly++;
   const int ncol_out = mcol0 + 12 * nmonthly;
   NumericMatrix out(n, ncol_out);
 
@@ -914,9 +871,9 @@ NumericMatrix wb_year_cpp(
     }
   }
   if (monthly) {
-    const char* labels[15] = {"cwd", "aet", "pet", "water", "soil", "pack", "ppt", "snowfall", "tmean", "rs", "rnet", "melt", "vpd", "runoff", "scover"};
+    const char* labels[14] = {"cwd", "aet", "pet", "water", "soil", "pack", "ppt", "snowfall", "tmean", "rs", "rnet", "melt", "vpd", "scover"};
     int col = mcol0;
-    for (int bit = 0; bit < 15; bit++) {
+    for (int bit = 0; bit < 14; bit++) {
       if (!(monthly & (1 << bit))) continue;
       for (int m = 0; m < 12; m++) {
         char buf[16];
@@ -1018,17 +975,9 @@ wb_fit_lapse_local <- function(tmean_stack, ppt_stack, dem_low, west, cfg) {
 }
 
 # ---------------- In-memory yearly engine ----------------
-# The yearly calculation runs on plain vectors with one value per cell that has
-# soil, not on rasters. For the 11 western states at 400 m that is about
-# 19.5 million cells and roughly 8 GB of RAM. Rasters are used only for setup
-# and for writing results.
+# The yearly calculation runs on plain vectors with one value per cell that has soil, not on rasters. For the 11 western states at 400 m that is about 19.5 million cells and roughly 8 GB of RAM. Rasters are used only for setup and for writing results.
 
-# Fixed inputs for every cell with soil, including the 12-month clear-sky
-# radiation table computed from each cell's slope, aspect, latitude and
-# elevation (see RadWorker in the C++ source). Only the sloped-surface table is
-# kept for all cells; the terrain modifier (slope / level ground) is summarized
-# from a random subsample and mapped separately, block by block
-# (wb_write_terrain_modifier), so no second full-size table is ever held.
+# Fixed inputs for every cell with soil, including the 12-month clear-sky radiation table computed from each cell's slope, aspect, latitude and elevation (see RadWorker in the C++ source). Only the sloped-surface table is kept for all cells; the terrain modifier (slope / level ground) is summarized from a random subsample and mapped separately, block by block (wb_write_terrain_modifier), so no second full-size table is ever held.
 wb_memory_site <- function(site, cfg, keep_cells = NULL) {
   awc <- values(site$SOILmax, mat = FALSE)
   cells <- which(is.finite(awc) & awc > 0)
@@ -1044,10 +993,6 @@ wb_memory_site <- function(site, cfg, keep_cells = NULL) {
        xy = xyFromCell(site$dem, cells), awc = awc[cells],
        hl = pick(site$HL), latitude = pick(site$latitude), elevation = pick(site$dem),
        lapse_t = slopes(site$lapse_t), beta_p = slopes(site$beta_p))
-  bad_lat <- !is.finite(mem$latitude) | abs(mem$latitude) > 90
-  if (any(bad_lat)) stop(sprintf(
-    "Latitude missing/invalid for %s of %s modeled AWC cells; check DEM/AWC masks and CRS before spin-up.",
-    format(sum(bad_lat), big.mark = ","), format(mem$n, big.mark = ",")))
   rm(awc); gc(verbose = FALSE)
   old <- wb_enter("Computing clear-sky radiation by month"); on.exit(.wb_log$context <- old, add = TRUE)
   cat("Computing monthly clear-sky radiation for ", format(mem$n, big.mark = ","), " cells...\n", sep = "")
@@ -1073,8 +1018,7 @@ wb_memory_site <- function(site, cfg, keep_cells = NULL) {
   mem
 }
 
-# Rough size of the in-memory engine. Stops before any large allocation when
-# the estimate exceeds the configured limit (or physical memory on macOS).
+# Rough size of the in-memory engine. Stops before any large allocation when the estimate exceeds the configured limit (or physical memory on macOS).
 wb_check_memory <- function(n, cfg) {
   bytes_per_cell <- 8 * (11 + 3 * 12 + 2 + 5 + 4 + 3) + 8 +  # vectors, three 12-column tables, outputs, state, wind-grid positions (v6.0)
     8 * 12 * min(length(cfg$monthly_output), cfg$monthly_chunk)   # monthly output columns held at once
@@ -1095,9 +1039,7 @@ wb_check_memory <- function(n, cfg) {
   invisible(need_gb)
 }
 
-# 12-layer terrain modifier (clear-sky radiation on the slope / on level ground
-# at the same place), written block by block as Float32 so the full table never
-# exists in memory.
+# 12-layer terrain modifier (clear-sky radiation on the slope / on level ground at the same place), written block by block as Float32 so the full table never exists in memory.
 wb_write_terrain_modifier <- function(site, cfg, path) {
   old <- wb_enter("Writing terrain modifier map", files = path); on.exit(.wb_log$context <- old, add = TRUE)
   out <- rast(site$dem, nlyrs = 12, names = paste0("terrain_modifier_", sprintf("%02d", 1:12)))
@@ -1122,8 +1064,7 @@ wb_write_terrain_modifier <- function(site, cfg, path) {
   invisible(rast(path))
 }
 
-# Static monthly normals (cloud transmittance, dew point) located on their own
-# coarse grid, or constant fallbacks when a normal is not used.
+# Static monthly normals (cloud transmittance, dew point) located on their own coarse grid, or constant fallbacks when a normal is not used.
 wb_memory_static <- function(mem, site, cfg) {
   none <- list(Sc = matrix(NA_real_, 1, 12), Ec = matrix(NA_real_, 1, 12), nr = 1L, nc = 1L,
                rowf = numeric(mem$n), colf = numeric(mem$n), covered = integer(mem$n))
@@ -1163,15 +1104,10 @@ wb_static_subset <- function(s, idx) {
 }
 
 # Identifies a climate grid by its dimensions, extent and coordinate system.
-# Extents are compared to 5 decimals of the grid's units: PRISM precipitation
-# and temperature files differ in the seventh decimal of a degree.
+# Extents are compared to 5 decimals of the grid's units: PRISM precipitation and temperature files differ in the seventh decimal of a degree.
 wb_grid_key <- function(x) paste(c(nrow(x), ncol(x), round(as.vector(ext(x)), 5), crs(x, proj = TRUE)), collapse = " ")
 
-# Where every cell sits on one coarse climate grid, and its elevation
-# difference (dz) from that grid. `layers` holds one or more data layers of the
-# grid. A cell is covered where terra's bilinear interpolation of every one of
-# those layers reaches it, so the same cells are simulated as when each month
-# was interpolated with project().
+# Where every cell sits on one coarse climate grid, and its elevation difference (dz) from that grid. `layers` holds one or more data layers of the grid. A cell is covered where terra's bilinear interpolation of every one of those layers reaches it, so the same cells are simulated as when each month was interpolated with project().
 wb_memory_grid <- function(mem, site, layers, dz) {
   old <- wb_enter("Locating cells on the climate grid", files = sources(layers)); on.exit(.wb_log$context <- old, add = TRUE)
   pos <- terra::project(mem$xy, crs(site$dem), crs(layers))
@@ -1183,9 +1119,7 @@ wb_memory_grid <- function(mem, site, layers, dz) {
        dz = values(dz, mat = FALSE)[mem$cells])
 }
 
-# One year for every cell: interpolate the 12 monthly grids, apply the
-# elevation adjustments and run the monthly water balance. Returns columns
-# cwd, aet, soil_end and pack_end; cells that cannot be simulated are NA.
+# One year for every cell: interpolate the 12 monthly grids, apply the elevation adjustments and run the monthly water balance. Returns columns cwd, aet, soil_end and pack_end; cells that cannot be simulated are NA.
 wb_year <- function(mem, grid, ppt, tmean, soil, pack, site, awc = mem$awc,
                     method = site$pet_method, diag = 0L, monthly = 0L, vpd = NULL) {
   old <- wb_enter("Monthly water-balance calculation"); on.exit(.wb_log$context <- old, add = TRUE)
@@ -1215,8 +1149,7 @@ wb_year <- function(mem, grid, ppt, tmean, soil, pack, site, awc = mem$awc,
               site$snow_albedo, site$snow_cover_mode, site$snow_cover_min, as.integer(monthly))
 }
 
-# Per-cell values back onto the model grid (one layer per column). Layers are
-# filled one at a time so the peak is one full-grid vector, not a matrix.
+# Per-cell values back onto the model grid (one layer per column). Layers are filled one at a time so the peak is one full-grid vector, not a matrix.
 wb_to_raster <- function(mem, x, layer_names) {
   x <- as.matrix(x)
   layers <- lapply(seq_len(ncol(x)), function(j) {
@@ -1239,8 +1172,7 @@ wb_change_stats <- function(previous, current, tolerance) {
        count = sum(ok), lost = sum(!is.na(previous) & is.na(current)), delta = delta)
 }
 
-# Carried soil and snow states are saved whole, then renamed into place, so an
-# interrupted write never leaves a half-written restart file.
+# Carried soil and snow states are saved whole, then renamed into place, so an interrupted write never leaves a half-written restart file.
 wb_save_state <- function(path, state) {
   dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
   tmp <- tempfile(tmpdir = dirname(path), fileext = ".rds")
@@ -1267,7 +1199,22 @@ wb_crop_climate <- function(x, site) {
 
 # ---------------- Configuration, runtime, and output integrity ----------------
 wb_validate <- function(cfg) {
-  for (field in c("base_dir", "dem_path", "aoi_path", "awc_path", "prism_root", "output_root"))
+  # AWC_CONSTANT_MM: one soil water storage (mm) for every model cell, in place of the soil rasters.
+  # When it is not set the element is dropped, so raster runs keep the settings list they had before the option existed.
+  if (is.null(cfg$awc_constant_mm) || identical(cfg$awc_constant_mm, NA) || !length(cfg$awc_constant_mm)) cfg$awc_constant_mm <- NULL
+  if (is.null(cfg$awc_path) || identical(cfg$awc_path, NA) || !length(cfg$awc_path) || !nzchar(cfg$awc_path[1])) cfg$awc_path <- NULL
+  if (!is.null(cfg$awc_constant_mm)) {
+    if (!is.numeric(cfg$awc_constant_mm) || length(cfg$awc_constant_mm) != 1 || !is.finite(cfg$awc_constant_mm) ||
+        cfg$awc_constant_mm <= 0 || cfg$awc_constant_mm > 5000)
+      stop("AWC_CONSTANT_MM must be one number of millimetres of soil water storage, greater than 0 and at most 5000, or NULL to use AWC_PATH.")
+    cfg$awc_constant_mm <- as.numeric(cfg$awc_constant_mm)
+    ignored <- c(if (!is.null(cfg$awc_path)) "AWC_PATH", if (!is.null(cfg$awc_depth_path) && !identical(cfg$awc_depth_path, NA)) "AWC_DEPTH_PATH")
+    wb_note(sprintf("AWC_CONSTANT_MM: soil water storage is %g mm in every cell; no soil raster is read%s.", cfg$awc_constant_mm,
+                    if (length(ignored)) paste0(" (", paste(ignored, collapse = " and "), " ignored)") else ""))
+    # The rasters and their unit settings play no part in a constant-soil run, so they are kept out of the run fingerprint.
+    cfg$awc_path <- NULL; cfg$awc_depth_path <- NULL; cfg$awc_units <- "mm"; cfg$awc_depth_mm <- NA_real_
+  } else if (is.null(cfg$awc_path)) stop("Set AWC_PATH (a soil raster) or AWC_CONSTANT_MM (one storage value in mm for every cell).")
+  for (field in c("base_dir", "dem_path", "aoi_path", if (!is.null(cfg$awc_path)) "awc_path", "prism_root", "output_root"))
     cfg[[field]] <- path.expand(cfg[[field]])
   # v5.4: AOI_BBOX (xmin, xmax, ymin, ymax in decimal degrees) replaces the AOI shapefile when set.
   if (is.null(cfg$aoi_bbox) || identical(cfg$aoi_bbox, NA) || !length(cfg$aoi_bbox)) cfg$aoi_bbox <- NULL
@@ -1278,7 +1225,7 @@ wb_validate <- function(cfg) {
       stop("AOI_BBOX must be c(xmin, xmax, ymin, ymax) in decimal degrees (longitude first), e.g. c(-122.5, -121.5, 44, 45.5).")
     cfg$aoi_bbox <- as.numeric(b)
   }
-  for (field in c("dem_path", if (is.null(cfg$aoi_bbox)) "aoi_path", "awc_path"))
+  for (field in c("dem_path", if (is.null(cfg$aoi_bbox)) "aoi_path", if (!is.null(cfg$awc_path)) "awc_path"))
     if (!file.exists(cfg[[field]])) stop("Missing ", field, ": ", cfg[[field]])
   check_years <- function(x, label) {
     if (!is.numeric(x) || !length(x) || any(!is.finite(x)) || any(x != as.integer(x)) ||
@@ -1289,20 +1236,18 @@ wb_validate <- function(cfg) {
   cfg$years_annual <- check_years(cfg$years_annual, "YEARS_ANNUAL")
   if (length(intersect(cfg$base_years, cfg$years_annual)))
     stop("Baseline and analysis years must not overlap.")
-  if (!is.null(cfg$analysis_initialization))
-    stop("analysis_initialization is removed: analysis always continues from the end of the baseline. Remove this option.")
-  if (min(cfg$years_annual) != max(cfg$base_years) + 1L)
-    stop("Analysis must begin in the year immediately following base_years; soil and snow state cannot be reset or skipped.")
+  if (cfg$analysis_initialization == "baseline_end" &&
+      min(cfg$years_annual) != max(cfg$base_years) + 1L)
+    stop("baseline_end requires analysis to start immediately after the baseline. Include intervening years, or explicitly choose equilibrium.")
+  if (!cfg$analysis_initialization %in% c("baseline_end", "equilibrium"))
+    stop("ANALYSIS_INITIALIZATION must be baseline_end or equilibrium.")
   if (!is.numeric(cfg$months_out) || !length(cfg$months_out) ||
       any(!is.finite(cfg$months_out)) || any(cfg$months_out != as.integer(cfg$months_out)) ||
       any(!cfg$months_out %in% 1:12)) stop("MONTHS_OUT must contain integers in 1:12.")
   cfg$months_out <- sort(unique(as.integer(cfg$months_out)))
   cfg$month_tag <- wb_month_tag(cfg$months_out)
-  valid_annual <- c("cwd", "aet", "pet", "ppt", "soil", "pack", "snow", "snow_peak", "melt", "runoff", "snowfall", "water", "balance")
-  if (!length(cfg$outputs_to_write) || any(!cfg$outputs_to_write %in% valid_annual))
-    stop("OUTPUTS_TO_WRITE must contain: ", paste(valid_annual, collapse = ", "))
-  if (is.null(cfg$summarize)) cfg$summarize <- FALSE
-  if (is.null(cfg$write_baseline)) cfg$write_baseline <- FALSE
+  if (!length(cfg$outputs_to_write) || any(!cfg$outputs_to_write %in% c("cwd", "aet")))
+    stop("OUTPUTS_TO_WRITE must contain cwd and/or aet.")
   for (field in c("spinup_max_iter", "wb_cores", "dem_aggregate_fact")) {
     x <- cfg[[field]]
     if (length(x) != 1 || !is.finite(x) || x < 1 || x != as.integer(x)) stop("Invalid ", field)
@@ -1310,10 +1255,23 @@ wb_validate <- function(cfg) {
   for (field in c("soil_tol_mm", "pack_tol_mm"))
     if (length(cfg[[field]]) != 1 || !is.finite(cfg[[field]]) || cfg[[field]] <= 0) stop("Invalid ", field)
   if (!cfg$dem_z_units %in% c("auto", "meters", "feet")) stop("Invalid DEM_Z_UNITS.")
-  if (!cfg$awc_units %in% c("mm", "cm", "m", "fraction")) stop("Invalid AWC_UNITS.")
-  if (cfg$awc_units == "fraction" && (length(cfg$awc_depth_mm) != 1 ||
+  if (!cfg$awc_units %in% c("mm", "cm", "m", "fraction", "mm_per_m")) stop("Invalid AWC_UNITS.")
+  # ---- Soil inputs (v6.3) ----
+  if (is.null(cfg$awc_depth_path) || identical(cfg$awc_depth_path, NA) || !nzchar(cfg$awc_depth_path[1])) cfg$awc_depth_path <- NULL
+  if (!is.null(cfg$awc_depth_path)) {
+    cfg$awc_depth_path <- path.expand(cfg$awc_depth_path)
+    if (!file.exists(cfg$awc_depth_path)) stop("Missing awc_depth_path: ", cfg$awc_depth_path)
+    if (!cfg$awc_units %in% c("fraction", "mm_per_m"))
+      stop("AWC_DEPTH_PATH multiplies a volumetric AWC: set AWC_UNITS to 'fraction' or 'mm_per_m' (a storage raster in mm already contains its depth).")
+    if (is.null(cfg$awc_depth_units) || !cfg$awc_depth_units %in% c("mm", "cm", "m", "in")) stop("AWC_DEPTH_UNITS must be mm, cm, m or in.")
+    cfg$awc_depth_mm <- NA_real_
+  } else if (cfg$awc_units %in% c("fraction", "mm_per_m") && (length(cfg$awc_depth_mm) != 1 ||
       !is.finite(cfg$awc_depth_mm) || cfg$awc_depth_mm <= 0))
-    stop("Volumetric AWC requires an explicit positive AWC_DEPTH_MM.")
+    stop("Volumetric AWC requires an explicit positive AWC_DEPTH_MM or an AWC_DEPTH_PATH raster.")
+  if (is.null(cfg$awc_resample)) cfg$awc_resample <- "bilinear"
+  if (!cfg$awc_resample %in% c("bilinear", "near")) stop("AWC_RESAMPLE must be 'bilinear' or 'near'.")
+  if (is.null(cfg$awc_source)) cfg$awc_source <- ""
+  if (is.null(cfg$awc_version)) cfg$awc_version <- ""
   if (!cfg$spinup_action %in% c("warn", "stop")) stop("Invalid SPINUP_ACTION.")
   if (!is.finite(cfg$spinup_max_pct) || cfg$spinup_max_pct < 0 || cfg$spinup_max_pct > 100)
     stop("Invalid SPINUP_MAX_PCT.")
@@ -1362,13 +1320,6 @@ wb_validate <- function(cfg) {
     wb_note(sprintf("WIND_PATH is NULL: Penman-Monteith uses a constant 2 m wind of %.2f m/s everywhere.", cfg$wind_constant))
   if (!is.logical(cfg$pet_diagnostics) || length(cfg$pet_diagnostics) != 1 || is.na(cfg$pet_diagnostics))
     stop("PET_DIAGNOSTICS must be TRUE or FALSE.")
-  if (is.null(cfg$zonal_path) || !length(cfg$zonal_path) || identical(cfg$zonal_path, NA)) cfg$zonal_path <- NULL
-  if (!is.null(cfg$zonal_path)) {
-    cfg$zonal_path <- path.expand(cfg$zonal_path)
-    if (!file.exists(cfg$zonal_path)) stop("Missing ZONAL_PATH: ", cfg$zonal_path)
-  }
-  if (is.null(cfg$zonal_monthly)) cfg$zonal_monthly <- character()
-  if (any(!cfg$zonal_monthly %in% c(wb_monthly_vars, "balance"))) stop("Invalid zonal monthly variable")
   # ---- Snow (v5.3) ----
   for (field in c("snow_t_all", "rain_t_all", "melt_mm_per_deg_day", "melt_radiation_weight"))
     if (length(cfg[[field]]) != 1 || !is.finite(cfg[[field]])) stop("Invalid ", toupper(field))
@@ -1386,18 +1337,18 @@ wb_validate <- function(cfg) {
   if (cfg$snow_albedo < 0 || cfg$snow_albedo >= 1) stop("SNOW_ALBEDO must be in [0, 1).")
   if (cfg$melt_method == "energy" && cfg$melt_mm_per_mj == 0)
     warning("MELT_METHOD is \"energy\" but MELT_MM_PER_MJ is 0: melt reduces to c_T * T with no radiation term.")
+  # ---- Demand under snow (v6.1) ----
+  if (is.null(cfg$snow_cover_demand)) cfg$snow_cover_demand <- "exclude"
+  if (!cfg$snow_cover_demand %in% c("exclude", "soil"))
+    stop('SNOW_COVER_DEMAND must be "exclude" (6.1 default) or "soil" (the 4.0-6.0 bookkeeping).')
+  if (is.null(cfg$snow_cover_min_mm)) cfg$snow_cover_min_mm <- 10
+  if (length(cfg$snow_cover_min_mm) != 1 || !is.finite(cfg$snow_cover_min_mm) || cfg$snow_cover_min_mm < 0)
+    stop("SNOW_COVER_MIN_MM must be a single number >= 0.")
   # Hamon needs no radiation normals unless the energy melt option reads them (v6.0; 5.5 dropped them under Hamon
   # and the energy melt then ran on undefined radiation). Hamon + degree_day reproduces 4.0 exactly.
   if (cfg$pet_method == "hamon" && cfg$melt_method == "degree_day") {
     cfg$static_types <- character(); cfg$climate_types <- c("ppt", "tmean")
   }
-  # Snow-covered fraction of month suppresses soil demand by default (v6.1).
-  if (is.null(cfg$snow_cover_demand)) cfg$snow_cover_demand <- "exclude"
-  if (length(cfg$snow_cover_demand) != 1L || !cfg$snow_cover_demand %in% c("exclude", "soil"))
-    stop('snow_cover_demand must be "exclude" or "soil".')
-  if (is.null(cfg$snow_cover_min_mm)) cfg$snow_cover_min_mm <- 10
-  if (length(cfg$snow_cover_min_mm) != 1L || !is.finite(cfg$snow_cover_min_mm) || cfg$snow_cover_min_mm < 0)
-    stop("snow_cover_min_mm must be a finite nonnegative number.")
   # ---- Monthly output (v5.2) ----
   vars <- wb_monthly_vars
   if (is.null(cfg$monthly_output) || identical(cfg$monthly_output, FALSE) || !length(cfg$monthly_output)) cfg$monthly_output <- character()
@@ -1419,10 +1370,7 @@ wb_validate <- function(cfg) {
     if (is.numeric(v) && length(v) && all(is.finite(v)) && all(v == as.integer(v))) return(as.integer(v))
     stop(label, " must be 'analysis', 'all', or a vector of years.")
   }
-  if (!length(cfg$monthly_output) || !isTRUE(cfg$write_rasters)) {
-    # No monthly GeoTIFFs requested: per-variable year schedules are irrelevant.
-    cfg$monthly_years_by_var <- list()
-  } else if (is.list(cfg$monthly_years)) {
+  if (is.list(cfg$monthly_years)) {
     bad <- setdiff(names(cfg$monthly_years), cfg$monthly_output)
     if (is.null(names(cfg$monthly_years)) || length(bad))
       stop("MONTHLY_YEARS as a list must be named by MONTHLY_OUTPUT variables; unknown: ", paste(bad, collapse = ", "))
@@ -1457,43 +1405,21 @@ wb_validate <- function(cfg) {
   cfg$points_neighbourhood <- as.integer(cfg$points_neighbourhood)
   if (is.null(cfg$write_rasters)) cfg$write_rasters <- TRUE
   if (!is.logical(cfg$write_rasters) || length(cfg$write_rasters) != 1 || is.na(cfg$write_rasters)) stop("WRITE_RASTERS must be TRUE or FALSE.")
-  if (!cfg$write_rasters && is.null(cfg$points_path) && is.null(cfg$zonal_path))
-    stop("No outputs requested: enable write_rasters or supply zonal_path or points_path.")
+  if (!cfg$write_rasters && is.null(cfg$points_path)) stop("WRITE_RASTERS is FALSE but no POINTS_PATH is set: the run would produce nothing.")
   if (!cfg$write_rasters && length(cfg$monthly_output)) {
     wb_note("WRITE_RASTERS is FALSE: MONTHLY_OUTPUT rasters are not written (points receive every monthly variable regardless).")
     cfg$monthly_output <- character(); cfg$monthly_mask <- 0L; cfg$monthly_years_by_var <- list()
   }
   if (!cfg$write_rasters && isTRUE(cfg$pet_diagnostics)) {
-    wb_note("WRITE_RASTERS is FALSE: PET self-check maps are skipped.")
+    wb_note("WRITE_RASTERS is FALSE: the PET self-check maps are skipped (the model runs on the point cells only).")
     cfg$pet_diagnostics <- FALSE
   }
-  if (is.null(cfg$prism_mode)) cfg$prism_mode <- "full"
-  if (!is.character(cfg$prism_mode) || length(cfg$prism_mode) != 1L ||
-      !cfg$prism_mode %in% c("full", "subset", "local"))
-    stop("prism_mode must be 'full', 'subset', or 'local'.")
-  if (is.null(cfg$prism_buffer_km)) cfg$prism_buffer_km <- 25
-  if (!is.numeric(cfg$prism_buffer_km) || length(cfg$prism_buffer_km) != 1L ||
-      !is.finite(cfg$prism_buffer_km) || cfg$prism_buffer_km < 0)
-    stop("prism_buffer_km must be a nonnegative number.")
-  # Local mode never initiates network downloads, regardless of allow_downloads.
-  if (cfg$prism_mode == "local") cfg$allow_downloads <- FALSE
   cfg$prism_dir <- file.path(cfg$prism_root, "PRISM_cache")
   cfg$prism_dir_v2 <- file.path(cfg$prism_dir, "api_v2_clean")
-  if (cfg$prism_mode == "subset") {
-    # Immutable AOI fingerprint prevents overlapping or changing study areas
-    # from accidentally selecting an undersized spatial subset.
-    geometry_key <- if (!is.null(cfg$aoi_bbox)) paste(cfg$aoi_bbox, collapse = ",") else
-      paste(normalizePath(cfg$aoi_path), paste(file.info(cfg$aoi_path)[c("size", "mtime")], collapse = ":"))
-    identifier <- paste(geometry_key, cfg$prism_res, cfg$prism_buffer_km,
-                        cfg$lapse_window_km, sep = "|")
-    keyfile <- tempfile(); writeLines(identifier, keyfile)
-    key <- substr(unname(tools::md5sum(keyfile)), 1, 16); unlink(keyfile)
-    cfg$prism_subset_dir <- file.path(cfg$prism_dir, "subsets", key)
-    cfg$prism_search_dirs <- cfg$prism_subset_dir
-  } else cfg$prism_search_dirs <- unique(c(cfg$prism_dir, cfg$prism_dir_v2))
+  cfg$prism_search_dirs <- unique(c(cfg$prism_dir, cfg$prism_dir_v2))
   if (isTRUE(cfg$run_aois_separately))
     stop("The flat output layout requires RUN_AOIS_SEPARATELY <- FALSE to avoid filename collisions.")
-  cfg$work_root <- tools::R_user_dir("water_balance_v6", "cache")
+  if (is.null(cfg$work_root)) cfg$work_root <- tools::R_user_dir("water_balance_v6_2", "cache")
   cfg$rcpp_cache_dir <- file.path(cfg$work_root, "cpp")
   cfg
 }
@@ -1504,11 +1430,12 @@ wb_setup_runtime <- function(cfg) {
   if (file.exists(file.path(cfg$proj_data_dir, "proj.db")))
     Sys.setenv(PROJ_LIB = cfg$proj_data_dir, PROJ_DATA = cfg$proj_data_dir)
   if (dir.exists(cfg$gdal_data_dir)) Sys.setenv(GDAL_DATA = cfg$gdal_data_dir)
-  # Use installed datum grids by default. Opportunistic PROJ network downloads
-  # can fail and produce empty geometry in some terra/prism environments.
+  # Use installed datum grids by default. Opportunistic PROJ network downloads can fail and produce empty geometry in some terra/prism environments.
   terra::projNetwork(isTRUE(cfg$proj_network))
   dir.create(cfg$output_root, recursive = TRUE, showWarnings = FALSE)
-  td <- tempfile(pattern = "terra_water_balance_v4_", tmpdir = tempdir())
+  temp_root <- if (is.null(cfg$temp_root)) tempdir() else cfg$temp_root
+  dir.create(temp_root, recursive = TRUE, showWarnings = FALSE)
+  td <- tempfile(pattern = "terra_water_balance_v4_", tmpdir = temp_root)
   .wb_log$temp_dir <- td
   dir.create(td, recursive = TRUE, showWarnings = FALSE)
   wb_check_space(td)
@@ -1544,17 +1471,16 @@ wb_input_files <- function(cfg) {
     candidates <- list.files(dirname(stem), full.names = TRUE)
     candidates[tolower(tools::file_path_sans_ext(basename(candidates))) == tolower(basename(stem))]
   } else cfg$aoi_path
-  unique(c(cfg$dem_path, cfg$awc_path, aoi_files, cfg$wind_path,
-           c(paste0(cfg$dem_path, ".aux.xml"), paste0(cfg$awc_path, ".aux.xml"))[
-             file.exists(c(paste0(cfg$dem_path, ".aux.xml"), paste0(cfg$awc_path, ".aux.xml")))]))
+  aux <- paste0(c(cfg$dem_path, cfg$awc_path), ".aux.xml")   # awc_path is NULL in a constant-soil run
+  unique(c(cfg$dem_path, cfg$awc_path, cfg$awc_depth_path, aoi_files, cfg$wind_path, aux[file.exists(aux)]))
 }
 
 wb_start_run <- function(cfg, index) {
-  # Full model settings and code hashes plus input size/mtime prevent accidental
-  # reuse across months, source data, model revisions, or initialization choices.
+  # Full model settings and code hashes plus input size/mtime prevent accidental reuse across months, source data, model revisions, or initialization choices.
   # Large raster inputs are not checksummed; preserve timestamps only deliberately.
   scientific <- cfg[setdiff(names(cfg), c("resume", "diagnostics", "pet_diagnostics", "memory_limit_gb", "monthly_output", "monthly_years", "monthly_stack", "monthly_mask", "monthly_datatype", "monthly_years_by_var", "monthly_chunk", "stop_after_setup",
-      "wb_cores", "terra_memfrac", "gdal_opts", "rcpp_cache_dir", "work_root", "output_root", "allow_downloads"))]
+      "wb_cores", "terra_memfrac", "gdal_opts", "rcpp_cache_dir", "work_root", "temp_root", "output_root", "allow_downloads", "prism_check_resident",
+      "awc_source", "awc_version"))]   # v6.3: labels only; the soil files themselves are fingerprinted
   identity <- list(settings = scientific, inputs = wb_file_stamp(wb_input_files(cfg)),
                    climate = wb_file_stamp(index$file),
                    packages = vapply(c("terra", "prism", "Rcpp", "RcppParallel"),
@@ -1568,7 +1494,7 @@ wb_start_run <- function(cfg, index) {
   writeLines(c(paste("Run:", cfg$run_id), paste("Months:", cfg$month_tag),
     paste("Baseline:", paste(range(cfg$base_years), collapse = "-")),
     paste("Analysis:", paste(range(cfg$years_annual), collapse = "-")),
-    "Analysis initialization: continuous from final baseline state",
+    paste("Analysis initialization:", cfg$analysis_initialization),
     "Input fingerprints use path, size, and modification time; see run_manifest.rds.",
     capture.output(sessionInfo())), file.path(cfg$run_dir, "run_info.txt"))
   write.csv(index, file.path(cfg$run_dir, "prism_inputs.csv"), row.names = FALSE)
@@ -1592,26 +1518,12 @@ wb_atomic_raster <- function(x, path, cfg, datatype = "FLT4S") {
   check <- rast(tmp)
   if (nlyr(check) != nlyr(x) || !compareGeom(check, x, stopOnError = FALSE))
     stop("Written raster failed validation: ", path)
-  # Force a complete read and compare the number of valid cells per band.
-  # Zero valid cells is permitted only when the corresponding source band is
-  # also entirely NA; it is not evidence of a corrupt raster on its own.
-  source_counts <- tryCatch(terra::global(x, "notNA")[, 1],
-                            error = function(e) stop("Cannot read source raster for ", path, ": ", conditionMessage(e)))
-  written_counts <- tryCatch(terra::global(check, "notNA")[, 1],
-                             error = function(e) stop("Cannot read written raster for ", path, ": ", conditionMessage(e)))
-  if (length(source_counts) != nlyr(x) || length(written_counts) != nlyr(x) ||
-      any(!is.finite(source_counts)) || any(!is.finite(written_counts)) ||
-      any(source_counts != written_counts))
-    stop("Written raster validity differs from source: ", path)
-  missing_bands <- which(written_counts == 0)
-  if (length(missing_bands)) {
-    msg <- paste0("All-NA annual raster band(s) retained: ",
-                  paste(names(check)[missing_bands], collapse = ", "), " in ", path)
-    warning(msg, call. = FALSE)
-  }
+  # Force a complete read before committing a raster or checkpoint marker.
+  counts <- global(check, "notNA")
+  if (any(!is.finite(counts[,1])) || any(counts[,1] == 0))
+    stop("Written raster contains an empty or unreadable band: ", path)
   rm(check)
-  # Atomic replacement on my macOS filesystem. If unsupported, leave the
-  # old file intact and report an error rather than deleting it first.
+  # Atomic replacement on a macOS filesystem. If unsupported, leave the old file intact and report an error rather than deleting it first.
   if (!file.rename(tmp, path)) stop("Could not atomically replace ", path)
   rast(path)
 }
@@ -1638,15 +1550,20 @@ wb_unit_kind <- function(u) {
   if (u %in% c("m", "meter", "meters", "metre", "metres")) return("m")
   if (u %in% c("ft", "foot", "feet", "us survey foot", "ftus")) return("feet")
   if (u %in% c("m3/m3", "m^3/m^3", "cm3/cm3", "cm^3/cm^3", "fraction", "1")) return("fraction")
+  if (u %in% c("mm/m", "mm per m", "mm_per_m")) return("mm_per_m")
   "unknown"
 }
 
 wb_check_awc <- function(raw, clip, cfg) {
   if (nlyr(raw) != 1L) stop("AWC must be one layer of available water storage or an explicitly configured volumetric AWC layer.")
+  depth_raster <- !is.null(cfg$awc_depth_path)
   u <- wb_metadata_units(raw)
   cat("AWC raster band units: ", if (nzchar(u)) u else "not declared", "\n", sep = "")
   cat("AWC configured units: ", cfg$awc_units, "; depth: ",
+      if (depth_raster) paste0("raster ", cfg$awc_depth_path, " (", cfg$awc_depth_units, ")") else
       if (is.finite(cfg$awc_depth_mm)) paste(cfg$awc_depth_mm, "mm") else "not supplied", "\n", sep = "")
+  cat("AWC resampling to the DEM grid: ", cfg$awc_resample, "\n", sep = "")
+  if (nzchar(cfg$awc_source)) cat("AWC source: ", cfg$awc_source, if (nzchar(cfg$awc_version)) paste0(" [", cfg$awc_version, "]"), "\n", sep = "")
   kind <- wb_unit_kind(u)
   if (kind != "unknown" && kind != cfg$awc_units)
     stop("Suspected AWC unit mismatch: metadata says '", u, "', AWC_UNITS says '", cfg$awc_units,
@@ -1658,14 +1575,44 @@ wb_check_awc <- function(raw, clip, cfg) {
   if (cfg$awc_units == "mm" && z[1,"max"] <= 1)
     warning("AWC values are all <= 1 while configured as mm. These could be volumetric fractions. Check source units/depth; values are not rescaled.")
   if (z[1,"min"] <= 0) warning("Nonpositive AWC cells will be excluded from the water balance.")
-  scale <- switch(cfg$awc_units, mm = 1, cm = 10, m = 1000, fraction = cfg$awc_depth_mm)
-  if (z[1,"max"] * scale > 2000)
+  # Scale to mm of storage. With a depth raster the depth is applied later cell by cell, so the scale here only turns the value into a fraction.
+  scale <- switch(cfg$awc_units, mm = 1, cm = 10, m = 1000,
+                  fraction = if (depth_raster) 1 else cfg$awc_depth_mm,
+                  mm_per_m = if (depth_raster) 1 / 1000 else cfg$awc_depth_mm / 1000)
+  if (cfg$awc_units == "mm_per_m" && (z[1,"min"] < 0 || z[1,"max"] > 1000))
+    stop("AWC in mm per metre must lie between 0 and 1000 (apart from NA).")
+  if (!depth_raster && z[1,"max"] * scale > 2000)
     warning("Some AWC storage exceeds 2000 mm. Check units, source depth, and missing-value coding; no additional rescaling is applied.")
   if (cfg$awc_units == "fraction" && (z[1,"min"] < 0 || z[1,"max"] > 1))
     stop("Volumetric AWC must lie between 0 and 1 (apart from NA).")
-  if (is.finite(cfg$awc_depth_mm) && z[1,"max"] * scale > cfg$awc_depth_mm)
+  if (!depth_raster && is.finite(cfg$awc_depth_mm) && z[1,"max"] * scale > cfg$awc_depth_mm)
     warning("AWC storage exceeds the configured profile depth. Check units and depth.")
   scale
+}
+
+# v6.3: depth raster (soil or rooting depth) converted to mm on the DEM grid.
+wb_depth_raster <- function(cfg, a, dem) {
+  d <- wb_step("Opening AWC depth raster", cfg$awc_depth_path, rast(cfg$awc_depth_path))
+  if (nlyr(d) != 1L) stop("AWC_DEPTH_PATH must be a single-layer depth raster.")
+  wb_require_crs(d, "AWC depth")
+  a_d <- project(a, d)
+  dc <- mask(crop(d, a_d, snap = "out"), a_d)
+  z <- global(dc, c("min", "max", "mean"), na.rm = TRUE)
+  cat("AWC depth raster (", cfg$awc_depth_units, "): min ", round(z[1,"min"], 1), " max ", round(z[1,"max"], 1), " mean ", round(z[1,"mean"], 1), "\n", sep = "")
+  if (!all(is.finite(as.numeric(z[1,])))) stop("No usable depth values in this AOI.")
+  if (z[1,"min"] < 0) warning("Negative depths will be excluded from the water balance.")
+  to_mm <- switch(cfg$awc_depth_units, mm = 1, cm = 10, m = 1000, "in" = 25.4)
+  depth <- project(dc, dem, method = cfg$awc_resample) * to_mm
+  if (global(depth, "max", na.rm = TRUE)[1,1] > 3000)
+    warning("Some depths exceed 3000 mm. Check AWC_DEPTH_UNITS.")
+  names(depth) <- "depth_mm"
+  depth
+}
+
+wb_file_stamp_text <- function(path) {
+  if (is.null(path) || !file.exists(path)) return(NA_character_)
+  i <- file.info(path)
+  paste0(basename(path), " (", format(i$size, big.mark = ","), " bytes, modified ", format(i$mtime, "%Y-%m-%d %H:%M"), ")")
 }
 
 wb_jobs <- function(cfg) {
@@ -1686,7 +1633,7 @@ wb_jobs <- function(cfg) {
   })
 }
 
-wb_prepare_site_uncached <- function(cfg, job) {
+wb_prepare_site <- function(cfg, job) {
   old <- wb_enter("Preparing terrain and soil", "not applicable", c(cfg$dem_path, cfg$aoi_path, cfg$awc_path)); on.exit(.wb_log$context <- old, add = TRUE)
   cat("\nPreparing ", job$label, "\n", sep = "")
   out_dir <- cfg$run_dir
@@ -1737,35 +1684,56 @@ wb_prepare_site_uncached <- function(cfg, job) {
   Af <- abs(180 - abs(aspect - 225)) * pi / 180
   hl_raw <- clamp(.339 + .808*cos(lat_rad)*cos(slope) - .196*sin(lat_rad)*sin(slope) -
                     .482*cos(Af)*sin(slope), 0, 2, values = TRUE)
-  # Divide by the flat-surface value at each cell's own latitude: level ground
-  # is exactly 1 everywhere, so only slope and aspect modify PET (day length in
-  # the PET equation already carries latitude).
+  # Divide by the flat-surface value at each cell's own latitude: level ground is exactly 1 everywhere, so only slope and aspect modify PET (day length in the PET equation already carries latitude).
   hl <- clamp(hl_raw / (.339 + .808*cos(lat_rad)), .2, 2, values = TRUE)
   names(hl) <- "HL"
   hl_range <- as.numeric(global(hl, c("min", "max"), na.rm = TRUE)[1,])
   cat("Heat-load modifier (1 = level ground):", paste(round(hl_range, 3), collapse = " to "),
       "; cell latitude range:", paste(round(latitude_range, 5), collapse = " to "), "\n")
-  awc <- wb_step("Opening AWC", cfg$awc_path, rast(cfg$awc_path))
-  wb_require_crs(awc, "AWC")
-  a_awc <- project(a, awc)
-  ac <- mask(crop(awc, a_awc, snap = "out"), a_awc)
-  scale <- wb_check_awc(awc, ac, cfg)
-  soil <- project(ac, dem, method = "bilinear")
-  if (scale != 1) soil <- soil * scale
+  if (!is.null(cfg$awc_constant_mm)) {                  # one storage value for every model cell; no soil raster
+    cat("Soil storage: constant ", cfg$awc_constant_mm, " mm in every cell (AWC_CONSTANT_MM); no soil raster is read.\n", sep = "")
+    awc <- NULL
+    soil <- dem * 0 + cfg$awc_constant_mm
+  } else {
+    awc <- wb_step("Opening AWC", cfg$awc_path, rast(cfg$awc_path))
+    wb_require_crs(awc, "AWC")
+    a_awc <- project(a, awc)
+    ac <- mask(crop(awc, a_awc, snap = "out"), a_awc)
+    scale <- wb_check_awc(awc, ac, cfg)
+    soil <- project(ac, dem, method = cfg$awc_resample)   # v6.3: "near" keeps map-unit edges sharp
+    if (scale != 1) soil <- soil * scale
+    if (!is.null(cfg$awc_depth_path)) {                   # v6.3: storage = volumetric AWC x depth, cell by cell
+      depth_mm <- wb_depth_raster(cfg, a, dem)
+      soil <- soil * depth_mm
+    }
+  }
   soil <- mask(soil, dem)
   soil <- ifel(soil > 0, soil, NA)
   names(soil) <- "SOILmax_mm"
   if (!is.finite(global(soil, "mean", na.rm = TRUE)[1,1])) stop("No positive AWC within the DEM/AOI.")
   compareGeom(dem, soil, hl, stopOnError = TRUE)
+  soil_z <- global(soil, c("min", "max", "mean"), na.rm = TRUE)
+  cat("Soil storage on the model grid (mm): min ", round(soil_z[1,"min"]), " max ", round(soil_z[1,"max"]), " mean ", round(soil_z[1,"mean"]), "\n", sep = "")
   metadata <- list(dem_z_units = chosen, awc_configured_units = cfg$awc_units,
-    awc_metadata_units = wb_metadata_units(awc), awc_depth_mm = cfg$awc_depth_mm,
+    awc_metadata_units = if (is.null(awc)) NA_character_ else wb_metadata_units(awc), awc_depth_mm = cfg$awc_depth_mm,
+    awc_constant_mm = if (is.null(cfg$awc_constant_mm)) NA_real_ else cfg$awc_constant_mm,
+    # ---- soil provenance (v6.3) ----
+    awc_source = cfg$awc_source, awc_version = cfg$awc_version,
+    awc_path = if (is.null(cfg$awc_path)) NA_character_ else cfg$awc_path, awc_file = wb_file_stamp_text(cfg$awc_path),
+    awc_depth_path = if (is.null(cfg$awc_depth_path)) NA_character_ else cfg$awc_depth_path,
+    awc_depth_units = if (is.null(cfg$awc_depth_path)) NA_character_ else cfg$awc_depth_units,
+    awc_depth_file = wb_file_stamp_text(cfg$awc_depth_path),
+    awc_resample = cfg$awc_resample,
+    soil_storage_mm = c(min = soil_z[1,"min"], max = soil_z[1,"max"], mean = soil_z[1,"mean"]),
     hl_normalization = "flat surface at each cell's latitude", hl_range = hl_range, latitude_method = "individual WGS84 cell centers", latitude_range_deg = latitude_range, resolution = res(dem),
     pet_method = cfg$pet_method, pt_alpha = cfg$pt_alpha, surface_albedo = cfg$surface_albedo,
     rad_diffuse_fraction = cfg$rad_diffuse_fraction, rad_step_minutes = cfg$rad_step_minutes,
     cloud_transmittance = cfg$cloud_transmittance, humidity_source = cfg$humidity_source,
     wind_path = cfg$wind_path, wind_constant = cfg$wind_constant, aero_scale = cfg$aero_scale,
     snow_t_all = cfg$snow_t_all, rain_t_all = cfg$rain_t_all, melt_mm_per_deg_day = cfg$melt_mm_per_deg_day,
-    melt_radiation_weight = cfg$melt_radiation_weight,
+    melt_radiation_weight = cfg$melt_radiation_weight, melt_method = cfg$melt_method,
+    melt_mm_per_mj = cfg$melt_mm_per_mj, snow_albedo = cfg$snow_albedo,
+    snow_cover_demand = cfg$snow_cover_demand, snow_cover_min_mm = cfg$snow_cover_min_mm,
     radiation = "clear-sky direct beam on the tilted surface integrated over the mid-month day, isotropic diffuse by sky view, terrain-reflected diffuse; no horizon shading")
   saveRDS(metadata, file.path(out_dir, "site_metadata.rds"))
   writeLines(capture.output(str(metadata)), file.path(out_dir, "site_metadata.txt"))
@@ -1778,14 +1746,12 @@ wb_prepare_site_uncached <- function(cfg, job) {
        melt_factor = cfg$melt_mm_per_deg_day, melt_rad_weight = cfg$melt_radiation_weight,
        melt_method = if (cfg$melt_method == "energy") 2L else 1L, melt_rad_factor = cfg$melt_mm_per_mj,
        snow_albedo = cfg$snow_albedo,
-       snow_cover_mode = if (cfg$snow_cover_demand == "exclude") 1L else 0L,
-       snow_cover_min = cfg$snow_cover_min_mm,
+       snow_cover_mode = if (cfg$snow_cover_demand == "exclude") 1L else 0L, snow_cover_min = cfg$snow_cover_min_mm,
        solar_declination = 0.409 * sin(2 * pi * (c(15,45,74,105,135,166,196,227,258,288,319,349) - 80) / 365),
        month_days = c(31,28,31,30,31,30,31,31,30,31,30,31))
 }
 
-# Preserve the established adjustment everywhere it is valid. Only repair
-# otherwise eligible cells lost when the AOI-masked DEM crosses the PRISM grid.
+# Preserve the established adjustment everywhere it is valid. Only repair otherwise eligible cells lost when the AOI-masked DEM crosses the PRISM grid.
 wb_repair_lapse_edges <- function(site, cfg, dem_low, dz) {
   needs <- is.na(dz) & !is.na(site$dem) & (site$SOILmax > 0)
   n_needed <- global(needs, "sum", na.rm = TRUE)[1,1]
@@ -1797,9 +1763,7 @@ wb_repair_lapse_edges <- function(site, cfg, dem_low, dz) {
   if (cfg$dem_aggregate_fact > 1)
     raw <- aggregate(raw, fact = cfg$dem_aggregate_fact, fun = mean, na.rm = TRUE)
   if (site$dem_z_units == "feet") raw <- raw * .3048
-  # Keep source elevations outside the AOI for this fallback only. Extend the
-  # existing grid to the already buffered PRISM footprint; do not choose a new
-  # model resolution, recompute terrain/heat load, or refit lapse coefficients.
+  # Keep source elevations outside the AOI for this fallback only. Extend the existing grid to the already buffered PRISM footprint; do not choose a new model resolution, recompute terrain/heat load, or refit lapse coefficients.
   footprint <- project(as.polygons(ext(dem_low), crs = crs(dem_low)), site$dem)
   padded_grid <- extend(rast(site$dem), ext(footprint), snap = "out")
   surrounding <- project(raw, padded_grid, method = "bilinear")
@@ -1818,10 +1782,7 @@ wb_repair_lapse_edges <- function(site, cfg, dem_low, dz) {
 wb_add_lapse <- function(site, cfg, index) {
   old <- wb_enter("Fitting lapse rates", "normals", index$file[index$is_normal]); on.exit(.wb_log$context <- old, add = TRUE)
   cat("\nPreparing PRISM normals for lapse-rate fitting...\n")
-  # Crop normals around the AOI bounding box with a multi-cell interpolation
-  # margin. No national-size values() allocation is needed for a local AOI.
-  # p is snapped to the PRISM grid; the other fields are cropped to it with nearest snapping,
-  # which keeps matching cell boundaries without interpolation (wb_climate_year).
+  # Crop normals around the AOI bounding box with a multi-cell interpolation margin. No national-size values() allocation is needed for a local AOI. p is snapped to the PRISM grid; the other fields are cropped to it with nearest snapping, which keeps matching cell boundaries without interpolation (wb_climate_year).
   normals <- wb_climate_year(index, site, cfg)
   p <- normals$ppt; tmean <- normals$tmean
   dem_low <- project(site$dem, p[[1]], method = "bilinear")
@@ -1864,10 +1825,7 @@ wb_add_lapse <- function(site, cfg, index) {
   site
 }
 
-# Static 2 m wind climatology for Penman-Monteith (v6.0): a 12-layer raster on any
-# grid (e.g. gridMET monthly means from calibrate_pt_alpha_vpd.R), cropped around
-# the site. Kept on its own grid and interpolated per cell in the engine, like the
-# cloud-transmittance and dew-point normals. NULL when a constant wind is used.
+# Static 2 m wind climatology for Penman-Monteith (v6.0): a 12-layer raster on any grid (e.g. gridMET monthly means from calibrate_pt_alpha_vpd.R), cropped around the site. Kept on its own grid and interpolated per cell in the engine, like the cloud-transmittance and dew-point normals. NULL when a constant wind is used.
 wb_read_wind <- function(site, cfg) {
   if (cfg$pet_method != "penman_monteith" || is.null(cfg$wind_path)) return(NULL)
   old <- wb_enter("Opening wind climatology", files = cfg$wind_path); on.exit(.wb_log$context <- old, add = TRUE)
@@ -1884,8 +1842,7 @@ wb_read_wind <- function(site, cfg) {
   w
 }
 
-# Static PRISM normals (cloud transmittance, dew point) on the cropped
-# precipitation-normal window. A normal on a different grid is resampled to it.
+# Static PRISM normals (cloud transmittance, dew point) on the cropped precipitation-normal window. A normal on a different grid is resampled to it.
 wb_static_normals <- function(site, cfg, index, p) {
   if (!length(cfg$static_types)) return(NULL)
   old <- wb_enter("Opening static PRISM normals", "normals", index$file[index$is_normal & index$type %in% cfg$static_types])
@@ -2002,86 +1959,7 @@ wb_extract_prism_zips <- function(cfg, missing) {
   invisible(NULL)
 }
 
-# Optional compact PRISM archive. PRISM's public web service returns ZIPs
-# containing COGs, rather than directly addressable COG URLs. This mode saves
-# persistent disk, NOT necessarily download bandwidth. Full archives are
-# downloaded into an ephemeral staging directory, cropped, and discarded.
-wb_prism_subset_extent <- function(cfg, raster) {
-  # Expand the AOI in a metric CRS before projection, including the entire
-  # lapse-fitting moving window and four coarse interpolation cells.
-  if (!is.null(cfg$aoi_bbox)) {
-    a <- terra::as.polygons(terra::ext(cfg$aoi_bbox), crs = "EPSG:4326")
-  } else a <- terra::vect(cfg$aoi_path)
-  if (!nzchar(terra::crs(a))) stop("AOI CRS is missing: cannot subset PRISM safely.")
-  a <- terra::project(a, "EPSG:5070")
-  # 4 extra PRISM pixels ensures that boundary interpolation has neighbours.
-  margin <- max(cfg$prism_buffer_km, cfg$lapse_window_km) * 1000 +
-    4 * if (cfg$prism_res == "4km") 4000 else if (cfg$prism_res == "800m") 800 else 400
-  area <- terra::as.polygons(terra::extend(terra::ext(a), margin), crs = "EPSG:5070")
-  terra::ext(terra::project(area, terra::crs(raster)))
-}
-
-wb_ensure_prism_subset <- function(cfg) {
-  dir.create(cfg$prism_subset_dir, recursive = TRUE, showWarnings = FALSE)
-  index <- wb_select_prism(cfg, wb_scan_prism(cfg))
-  missing <- wb_missing_prism(cfg, index)
-  if (!nrow(missing)) return(index)
-  if (!cfg$allow_downloads)
-    stop("PRISM subset is missing ", nrow(missing), " variable/month combinations; downloads disabled.")
-  # One year/type group at a time to limit peak temporary disk usage.
-  groups <- split(missing, paste(missing$type, ifelse(is.na(missing$year), "normals", missing$year)))
-  for (part in groups) {
-    # Recheck to skip groups already completed by a prior interrupted run.
-    outstanding <- wb_missing_prism(cfg, wb_select_prism(cfg, wb_scan_prism(cfg)))
-    key <- function(d) paste(d$type, d$year, d$month)
-    part <- part[key(part) %in% key(outstanding), , drop = FALSE]
-    if (!nrow(part)) next
-    stage <- tempfile("prism_subset_staging_")
-    dir.create(stage, recursive = TRUE)
-    tryCatch({
-      prism::prism_set_dl_dir(stage)
-      type <- part$type[1]
-      if (is.na(part$year[1])) {
-        prism::get_prism_normals(type = type, resolution = cfg$prism_res,
-                                mon = unique(part$month), keepZip = TRUE)
-      } else {
-        prism::get_prism_monthlys(type = type, years = part$year[1],
-                                 mon = unique(part$month), resolution = cfg$prism_res,
-                                 keepZip = TRUE)
-      }
-      tmp_cfg <- cfg
-      tmp_cfg$prism_search_dirs <- stage
-      tmp_cfg$prism_dir_v2 <- stage
-      wb_extract_prism_zips(tmp_cfg, part)
-      sources <- wb_scan_prism(tmp_cfg)
-      key_part <- paste(part$type, ifelse(is.na(part$year), "normal", part$year), part$month)
-      key_src <- paste(sources$type, ifelse(sources$is_normal, "normal", sources$year), sources$month)
-      sources <- sources[key_src %in% key_part, , drop = FALSE]
-      if (!nrow(sources)) stop("PRISM archive contained no usable TIFFs for ", type)
-      for (i in seq_len(nrow(sources))) {
-        src <- sources$file[i]
-        x <- terra::rast(src)
-        window <- wb_prism_subset_extent(cfg, x)
-        clipped <- terra::crop(x, window, snap = "out")
-        if (is.null(clipped) || !terra::ncell(clipped))
-          stop("PRISM spatial subset does not overlap AOI: ", src)
-        dst <- file.path(cfg$prism_subset_dir, paste0(tools::file_path_sans_ext(basename(src)), "_subset.tif"))
-        tempdst <- paste0(dst, ".partial.tif")
-        terra::writeRaster(clipped, tempdst, overwrite = TRUE,
-                           wopt = list(gdal = c("COMPRESS=DEFLATE", "TILED=YES")))
-        if (!file.rename(tempdst, dst)) stop("Cannot finalize PRISM subset: ", dst)
-      }
-    }, finally = unlink(stage, recursive = TRUE, force = TRUE))
-  }
-  index <- wb_select_prism(cfg, wb_scan_prism(cfg))
-  missing <- wb_missing_prism(cfg, index)
-  if (nrow(missing)) stop("PRISM subset cache incomplete; ", nrow(missing), " combinations missing.")
-  cat("PRISM spatial subset complete: ", nrow(index), " rasters at ", cfg$prism_subset_dir, "\n", sep = "")
-  index
-}
-
 wb_ensure_prism <- function(cfg) {
-  if (identical(cfg$prism_mode, "subset")) return(wb_ensure_prism_subset(cfg))
   index <- wb_select_prism(cfg, wb_scan_prism(cfg))
   missing <- wb_missing_prism(cfg, index)
   if (nrow(missing)) {
@@ -2121,7 +1999,65 @@ wb_ensure_prism <- function(cfg) {
   if (any(index$is_normal & is.na(index$normal_end)))
     warning("Some legacy normals do not encode their reference-period end year. Confirm their period in prism_inputs.csv and the source metadata.")
   cat("PRISM input rasters selected:", nrow(index), "; cache preserved.\n")
+  wb_check_prism_resident(cfg, index)
   index
+}
+
+# Cloud-evicted or empty cache files (v6.3). iCloud "Optimize Mac Storage" (and OneDrive/Dropbox equivalents)
+# replace a file it has not used for a while with a dataless placeholder that keeps the name and the full logical
+# size, so file.exists() and file.size() pass, the cache scan selects it, and GDAL fails only when the year loop
+# opens it ("not recognized as a supported file format", GDAL error 4), often hours into the baseline. This check
+# runs once at startup, after the cache index is complete and before terrain, lapse fitting and spin-up. It reads
+# nothing and changes nothing: on macOS it asks du for the blocks actually on disk (0 for a dataless file) and on
+# every platform it flags zero-length files; sidecars (.hdr, .prj, ...) beside each selected raster are included.
+# Performance-only: PRISM_CHECK_RESIDENT is not part of the run fingerprint.
+wb_check_prism_resident <- function(cfg, index) {
+  if (isFALSE(cfg$prism_check_resident) || !nrow(index)) return(invisible(character()))
+  old <- wb_enter("Checking PRISM cache files are on disk"); on.exit(.wb_log$context <- old, add = TRUE)
+  files <- index$file
+  stems <- basename(tools::file_path_sans_ext(files))
+  dirs <- dirname(files)
+  all_files <- unique(unlist(lapply(unique(dirs), function(d) {
+    f <- list.files(d, full.names = TRUE, all.files = FALSE)
+    f[basename(tools::file_path_sans_ext(sub("\\.aux\\.xml$", "", f))) %in% stems[dirs == d]]
+  })))
+  all_files <- all_files[!dir.exists(all_files)]
+  size <- file.size(all_files)
+  empty <- all_files[!is.na(size) & size == 0]
+  evicted <- character()
+  if (identical(unname(Sys.info()[["sysname"]]), "Darwin") && nzchar(Sys.which("ls"))) {
+    # The explicit file flag (ls -lO prints "dataless" in the flags column) rather than allocated blocks:
+    # macOS keeps small files under transparent compression with zero blocks on disk even when they are present.
+    for (chunk in split(all_files, ceiling(seq_along(all_files) / 200))) {
+      out <- tryCatch(suppressWarnings(system2("ls", c("-ldO", shQuote(chunk)), stdout = TRUE, stderr = FALSE)),
+                      error = function(e) character())
+      if (!length(out)) next
+      m <- regmatches(out, regexec("^\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+(\\S+)\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+(.*)$", out))
+      flags <- vapply(m, function(x) if (length(x) == 3L) x[2] else "", character(1))
+      path <- vapply(m, function(x) if (length(x) == 3L) x[3] else "", character(1))
+      evicted <- c(evicted, path[grepl("dataless", flags, fixed = TRUE) & path %in% chunk])
+    }
+  }
+  bad <- unique(c(empty, evicted))
+  if (!length(bad)) {
+    cat("PRISM cache files on disk:", length(all_files), "checked, all readable.\n")
+    return(invisible(character()))
+  }
+  dir.create(cfg$output_root, recursive = TRUE, showWarnings = FALSE)
+  list_path <- file.path(cfg$output_root, "prism_cache_not_resident.txt")
+  writeLines(bad, list_path)
+  cache_gb <- sum(file.size(files), na.rm = TRUE) / 1e9
+  stop(sprintf(paste0(
+    "%d of %d PRISM cache files hold no bytes on disk (%d evicted to cloud storage, %d empty) in %d folders.\n",
+    "They appear in directory listings with their full size, but GDAL cannot read them (error 4), so the run would fail in the year loop.\n",
+    "Full list written to: %s\nFirst of them:\n%s\n",
+    "To restore from iCloud (Terminal; wait until the dataless count reaches 0, then rerun - RESUME continues from the last finished year):\n",
+    "  while IFS= read -r f; do brctl download \"$f\"; done < %s\n",
+    "  ls -lRO %s | grep -c dataless\n",
+    "The selected PRISM rasters total %.0f GB; the disk must hold all of them for the whole run, or iCloud will evict again.\n",
+    "The durable fix is a PRISM_cache outside the synced folder (set PRISM_ROOT to it). PRISM_CHECK_RESIDENT <- FALSE skips this check."),
+    length(bad), length(all_files), length(evicted), length(setdiff(empty, evicted)), length(unique(dirname(bad))),
+    list_path, paste(" ", head(bad, 12), collapse = "\n"), shQuote(list_path), shQuote(cfg$prism_dir_v2), cache_gb))
 }
 
 wb_climate_stack <- function(index, type, year = NULL) {
@@ -2140,13 +2076,12 @@ wb_climate_stack <- function(index, type, year = NULL) {
 
 
 
-# PRISM vpdmax and vpdmin are supplied in hPa; convert their mean to kPa
-# for Penman-Monteith (1 kPa = 10 hPa). Normals when year is NULL.
-# Leave cached PRISM rasters in their original units.
+# Monthly vapour-pressure deficit as PRISM defines it: the mean of the vpdmax and vpdmin monthly fields (v6.0). PRISM distributes VPD in hectopascals (vpdmax over the West reaches about 70 hPa); the engine, the wind climatology calibration and the monthly vpd output all use kPa, so the stack is converted here, once. Normals when year is NULL.
+wb_vpd_hpa_to_kpa <- 0.1
 wb_vpd_stack <- function(index, year = NULL) {
   hi <- wb_climate_stack(index, "vpdmax", year); lo <- wb_climate_stack(index, "vpdmin", year)
   if (!compareGeom(hi, lo, stopOnError = FALSE)) stop("PRISM vpdmax and vpdmin grids differ (", if (is.null(year)) "normals" else year, ").")
-  x <- (hi + lo) / 20  # mean of two hPa fields, converted to kPa
+  x <- (hi + lo) / 2 * wb_vpd_hpa_to_kpa
   names(x) <- paste0("vpd_", sprintf("%02d", 1:12))
   x
 }
@@ -2162,9 +2097,17 @@ wb_climate_year <- function(index, site, cfg, year = NULL) {
     vpd <- crop(wb_vpd_stack(index, year), p, snap = "near")
     if (!compareGeom(p, vpd, stopOnError = FALSE))
       stop("PRISM vapour-pressure deficit grid differs from the precipitation grid (", if (is.null(year)) "normals" else year, ").")
+    # After the hPa -> kPa conversion in wb_vpd_stack: monthly means over the West run 0-7 kPa, and no part of the West has an annual maximum below about 0.5 kPa. A maximum under 0.3 means the files were already in kPa (the conversion was applied twice); above 12 means some other unit.
     rng <- as.numeric(as.matrix(global(vpd, c("min", "max"), na.rm = TRUE)))
+    lab <- if (is.null(year)) "normals" else year
     if (min(rng, na.rm = TRUE) < -0.01 || max(rng, na.rm = TRUE) > 12)
-      stop("Converted PRISM vapour-pressure deficit is expected in kPa (0-12); found ", paste(round(range(rng), 2), collapse = " to "))
+      stop("PRISM vapour-pressure deficit (", lab, ") is read as hectopascals and converted to kPa; after conversion ",
+           "the values should lie within 0-12 kPa but run ", paste(round(range(rng), 2), collapse = " to "),
+           ". Check the vpdmax/vpdmin files in the PRISM cache.")
+    if (max(rng, na.rm = TRUE) < 0.3)
+      stop("PRISM vapour-pressure deficit (", lab, ") after the hPa -> kPa conversion peaks at ", round(max(rng, na.rm = TRUE), 3),
+           " kPa, which is too low for any part of the West. The files appear to be in kPa already; ",
+           "set wb_vpd_hpa_to_kpa <- 1 in the functions file if that is confirmed.")
   }
   list(ppt = p, tmean = tmean, vpd = vpd)
 }
@@ -2194,8 +2137,6 @@ wb_spinup <- function(site, cfg, mem, grids) {
   converged <- FALSE
   for (i in seq_len(cfg$spinup_max_iter)) {
     x <- wb_year(mem, grid, site$normals$ppt, site$normals$tmean, soil, pack, site, vpd = site$normals$vpd)
-    if (all(is.na(x[, "soil_end"])) || all(is.na(x[, "pack_end"])))
-      stop("Spin-up returned all-NA model states. Verify PRISM coverage, AWC, lapse fields, and latitude; not a snow convergence result.")
     ds <- wb_change_stats(soil, x[, "soil_end"], cfg$soil_tol_mm)
     dp <- wb_change_stats(pack, x[, "pack_end"], cfg$pack_tol_mm)
     records[[i]] <- data.frame(iteration = i, soil_mean_mm = ds$mean, soil_max_mm = ds$max,
@@ -2243,10 +2184,7 @@ wb_spinup <- function(site, cfg, mem, grids) {
                            info = list(converged = converged, iterations = i)))
 }
 
-# PET self-check over the climate normals: monthly Hamon x heat load (v4),
-# Priestley-Taylor and, when the vapour-pressure deficit normals are present,
-# Penman-Monteith PET from the spun-up state, plus the radiation table. Written
-# whatever PET_METHOD drives the run, so a new area can be checked at once.
+# PET self-check over the climate normals: monthly Hamon x heat load (v4), Priestley-Taylor and, when the vapour-pressure deficit normals are present, Penman-Monteith PET from the spun-up state, plus the radiation table. Written whatever PET_METHOD drives the run, so a new area can be checked at once.
 # Monthly tables come from a subsample of cells; annual maps cover every cell.
 wb_pet_check <- function(site, cfg, mem, grids, spin) {
   old <- wb_enter("PET self-check", "normals"); on.exit(.wb_log$context <- old, add = TRUE)
@@ -2306,13 +2244,10 @@ wb_pet_check <- function(site, cfg, mem, grids, spin) {
   invisible(report)
 }
 
-# Monthly output files: <output_root>/monthly/<VAR>_monthly_<unit>_<year>.tif,
-# 12 layers each (mm; soil and pack are end-of-month states; ppt is the
-# downscaled monthly precipitation and snowfall its snow share; vpd is the
-# downscaled vapour-pressure deficit in kPa, Penman-Monteith runs only).
-wb_monthly_vars <- c("cwd", "aet", "pet", "water", "soil", "pack", "ppt", "snowfall", "tmean", "rs", "rnet", "melt", "vpd", "runoff", "scover")
+# Monthly output files: <output_root>/monthly/<VAR>_monthly_<unit>_<year>.tif, 12 layers each (mm; soil and pack are end-of-month states; ppt is the downscaled monthly precipitation and snowfall its snow share; vpd is the downscaled vapour-pressure deficit in kPa, Penman-Monteith runs only; scover is the snow-covered share of the month, 0-1, v6.1).
+wb_monthly_vars <- c("cwd", "aet", "pet", "water", "soil", "pack", "ppt", "snowfall", "tmean", "rs", "rnet", "melt", "vpd", "scover")
 wb_monthly_units <- c(cwd = "mm", aet = "mm", pet = "mm", water = "mm", soil = "mm", pack = "mm", ppt = "mm", snowfall = "mm",
-                      tmean = "C", rs = "MJm2d", rnet = "MJm2d", melt = "mm", vpd = "kPa", runoff = "mm", scover = "frac")
+                      tmean = "C", rs = "MJm2d", rnet = "MJm2d", melt = "mm", vpd = "kPa", scover = "frac")
 wb_monthly_paths <- function(cfg, vars, year) {
   file.path(cfg$output_root, "monthly", paste0(toupper(vars), "_monthly_", wb_monthly_units[vars], "_", year, ".tif"))
 }
@@ -2332,8 +2267,7 @@ wb_write_monthly <- function(mem, x, cfg, year, vars = cfg$monthly_output) {
   invisible(NULL)
 }
 
-# Optional stacked monthly product per variable: 12 x N layers over the years
-# that have monthly files. Large; off unless MONTHLY_STACK is TRUE.
+# Optional stacked monthly product per variable: 12 x N layers over the years that have monthly files. Large; off unless MONTHLY_STACK is TRUE.
 wb_monthly_stacks <- function(cfg) {
   if (!length(cfg$monthly_output) || !cfg$monthly_stack) return(invisible(NULL))
   old <- wb_enter("Stacking monthly rasters"); on.exit(.wb_log$context <- old, add = TRUE)
@@ -2351,11 +2285,7 @@ wb_monthly_stacks <- function(cfg) {
 }
 
 # ---------------- Points (v5.5) ----------------
-# Points come from a CSV with longitude/latitude columns (WGS84) or any vector
-# file terra can read. Each point is matched to its DEM cell; with a
-# neighbourhood of 3 or 5 the cells around it are averaged. Every monthly
-# variable the engine knows and the annual CWD/AET sums are written to
-# <output_root>/points/points_monthly.csv and points_annual.csv.
+# Points come from a CSV with longitude/latitude columns (WGS84) or any vector file terra can read. Each point is matched to its DEM cell; with a neighbourhood of 3 or 5 the cells around it are averaged. Every monthly variable the engine knows and the annual CWD/AET sums are written to <output_root>/points/points_monthly.csv and points_annual.csv.
 wb_read_points <- function(cfg, site) {
   old <- wb_enter("Reading points", files = cfg$points_path); on.exit(.wb_log$context <- old, add = TRUE)
   ext_ <- tolower(tools::file_ext(cfg$points_path))
@@ -2420,8 +2350,7 @@ wb_points_rows <- function(points, mem, cfg) {
   points
 }
 
-# The in-memory inputs for a subset of rows, so the engine can be run on the
-# point cells alone (full-raster runs) at negligible cost.
+# The in-memory inputs for a subset of rows, so the engine can be run on the point cells alone (full-raster runs) at negligible cost.
 wb_mem_subset <- function(mem, idx) {
   list(n = length(idx), cells = mem$cells[idx], template = mem$template, awc = mem$awc[idx], hl = mem$hl[idx],
        latitude = mem$latitude[idx], elevation = mem$elevation[idx], rad = mem$rad[idx, , drop = FALSE],
@@ -2431,8 +2360,7 @@ wb_mem_subset <- function(mem, idx) {
 wb_grid_subset <- function(grid, idx) list(key = grid$key, nr = grid$nr, nc = grid$nc, rowf = grid$rowf[idx],
                                            colf = grid$colf[idx], covered = grid$covered[idx], dz = grid$dz[idx])
 
-# Point values for one year from an engine result that holds every monthly
-# variable (rows = points$sub when `subset` is TRUE, otherwise all of mem).
+# Point values for one year from an engine result that holds every monthly variable (rows = points$sub when `subset` is TRUE, otherwise all of mem).
 wb_points_year <- function(x, points, year, stage, cfg, subset = TRUE) {
   rows <- if (subset) points$sub_rows else points$rows
   avg <- function(col) { v <- matrix(x[as.vector(rows), col], nrow = nrow(rows)); m <- rowMeans(v, na.rm = TRUE); m[is.nan(m)] <- NA; m }
@@ -2466,6 +2394,7 @@ wb_points_write <- function(cfg, site, points, stage_dirs) {
     "  tmean: downscaled mean temperature (C); rs: incoming shortwave on the cell's slope under the month's cloudiness (MJ m-2 d-1)",
     "  rnet: net radiation at a snow surface, (1 - SNOW_ALBEDO) x rs - net longwave (MJ m-2 d-1)",
     "  vpd: downscaled monthly vapour-pressure deficit (kPa); NA unless PET_METHOD is penman_monteith",
+    "  scover: snow-covered share of the month (0-1); under SNOW_COVER_DEMAND = \"exclude\" only (1 - scover) x pet reaches the soil balance",
     sprintf("points_annual.csv: CWD and AET summed over MONTHS_OUT (%s), matching the annual rasters.", cfg$month_tag),
     sprintf("Values are the mean of a %d x %d cell neighbourhood around each point (POINTS_NEIGHBOURHOOD); stage is baseline or analysis.",
             cfg$points_neighbourhood, cfg$points_neighbourhood),
@@ -2475,70 +2404,18 @@ wb_points_write <- function(cfg, site, points, stage_dirs) {
   invisible(NULL)
 }
 
-# Persist the converged end-of-baseline state independently of the requested
-# output variables, output directory, and zonal geography. Changes to the
-# scientific inputs invalidate the cache. No intermediate spin-up rasters are
-# retained here.
-wb_initialization_cache <- function(cfg, index, site, mem) {
-  science_fields <- c(
-    "base_years", "dem_aggregate_fact", "dem_z_units", "dem_source_crs",
-    "metric_crs", "awc_units", "awc_depth_mm", "prism_res",
-    "prism_normal_end_year", "lapse_window_km", "lapse_t_limits",
-    "lapse_p_limits", "lapse_seed", "spinup_max_iter", "soil_tol_mm",
-    "pack_tol_mm", "spinup_max_pct", "spinup_action", "pet_method",
-    "pt_alpha", "wind_constant", "aero_scale", "surface_albedo",
-    "rad_diffuse_fraction", "rad_step_minutes", "cloud_transmittance",
-    "humidity_source", "snow_t_all", "rain_t_all", "melt_method",
-    "melt_mm_per_deg_day", "melt_mm_per_mj", "snow_albedo",
-    "melt_radiation_weight", "snow_cover_demand", "snow_cover_min_mm", "code_md5"
-  )
-  historical <- index[is.na(index$year) | index$is_normal |
-                        (!is.na(index$year) & index$year %in% cfg$base_years), , drop = FALSE]
-  # Source climate files, not output settings, determine initialization identity.
-  identity <- list(version = 1L, environment = list(inputs = wb_file_stamp(wb_input_files(cfg)),
-                                        n = mem$n, grid = c(terra::nrow(site$dem), terra::ncol(site$dem),
-                                         terra::res(site$dem), as.vector(terra::ext(site$dem)))),
-                   science = cfg[intersect(science_fields, names(cfg))],
-                   baseline_climate = wb_file_stamp(historical$file),
-                   packages = vapply(c("terra", "prism", "Rcpp", "RcppParallel"),
-                                     function(x) as.character(utils::packageVersion(x)), character(1)))
-  key <- wb_hash(identity)
-  root <- cfg$environment_cache
-  if (is.null(root) || !nzchar(root))
-    root <- file.path(dirname(normalizePath(cfg$dem_path, mustWork = TRUE)), ".wbr_prepared_environment")
-  path <- file.path(path.expand(root), "initialization_states", key, "baseline_end.rds")
-  list(key = key, path = path, identity = identity)
-}
-
-wb_cached_baseline <- function(path, key, n, last_year) {
-  x <- wb_read_state(path, key)
-  if (is.null(x) || !identical(x$year, as.integer(last_year))) return(NULL)
-  for (name in c("soil", "pack", "snow_autumn", "snow_autumn_peak")) {
-    if (!is.numeric(x[[name]]) || length(x[[name]]) != n) return(NULL)
-  }
-  if (any(!is.finite(x$soil)) || any(!is.finite(x$pack))) return(NULL)
-  x
-}
-
-wb_run_sequence <- function(site, cfg, index, years, initial, stage, mem, grids, points = NULL, zonal = NULL) {
-  emit_annual <- isTRUE(cfg$write_rasters) && (stage != "baseline" || isTRUE(cfg$write_baseline))
-  if (stage == "baseline" && emit_annual && any(cfg$outputs_to_write %in% c("snow", "pack", "snow_peak")) && is.null(initial$snow_autumn)) stop("Baseline seasonal snow requires preceding autumn state; disable write_baseline or supply prior autumn values.")
-
+wb_run_sequence <- function(site, cfg, index, years, initial, stage, mem, grids, points = NULL) {
   old <- wb_enter(stage); on.exit(.wb_log$context <- old, add = TRUE)
   dir <- file.path(site$out_dir, paste0(stage, "_years"))
   dir.create(dir, recursive = TRUE, showWarnings = FALSE)
   paths <- file.path(dir, paste0("WB_", cfg$month_tag, "_mm_", years, ".tif"))
-  # Monthly rasters (one file per variable and year) go straight to the output
-  # folder; they are part of each year's completion record for resume checks.
+  # Monthly rasters (one file per variable and year) go straight to the output folder; they are part of each year's completion record for resume checks.
   vars_for_year <- function(y) cfg$monthly_output[vapply(cfg$monthly_output, function(v) y %in% cfg$monthly_years_by_var[[v]], logical(1))]
   monthly_paths <- function(j) { v <- vars_for_year(years[j]); if (length(v)) wb_monthly_paths(cfg, v, years[j]) else character() }
-  zonal_paths <- function(j) if (is.null(zonal)) character() else file.path(dir, paste0("zonal_", years[seq_len(j)], ".rds"))
   points_paths <- if (is.null(points)) function(j) character() else function(j) file.path(dir, paste0("points_", years[seq_len(j)], ".rds"))
-  stamp_paths <- function(j) c(if (emit_annual) paths[seq_len(j)], unlist(lapply(seq_len(j), monthly_paths)), points_paths(j), zonal_paths(j))
+  stamp_paths <- function(j) c(if (cfg$write_rasters) paths[seq_len(j)], unlist(lapply(seq_len(j), monthly_paths)), points_paths(j))
   all_monthly <- as.integer(sum(2^(seq_along(wb_monthly_vars) - 1L)))
-  # One restart file per stage holds the soil and snow carried out of the last
-  # finished year. It is trusted only if this run wrote it and every annual
-  # raster it lists is unchanged.
+  # One restart file per stage holds the soil and snow carried out of the last finished year. It is trusted only if this run wrote it and every annual raster it lists is unchanged.
   state_path <- file.path(dir, "state.rds")
   key <- list(run = cfg$run_id, site = site$label, stage = stage)
   state <- if (cfg$resume) wb_read_state(state_path, key) else NULL
@@ -2555,99 +2432,21 @@ wb_run_sequence <- function(site, cfg, index, years, initial, stage, mem, grids,
     clim <- wb_climate_year(index, site, cfg, yr)
     p <- clim$ppt; tmean <- clim$tmean; vpd <- clim$vpd
     mvars <- vars_for_year(yr)
-    zvars <- if (is.null(zonal)) character() else cfg$zonal_monthly
-    annual_vars <- unique(c(if (emit_annual) ifelse(cfg$outputs_to_write %in% c("snow", "snow_peak"), "pack", cfg$outputs_to_write) else character(),
-                            if (stage == "baseline") "pack" else character()))
-    needed <- unique(c(mvars, setdiff(zvars, "balance"), setdiff(annual_vars, "balance")))
     grid <- wb_grid_for(p, tmean, site, mem, grids)
-    chunks <- if (!cfg$write_rasters) list(needed) else if (length(needed))
-      split(needed, ceiling(seq_along(needed) / cfg$monthly_chunk)) else list(character())
+    # Points-only runs (mem already holds just the point cells) take every monthly variable at once.
+    # Full-grid runs take the monthly variables in chunks of MONTHLY_CHUNK: the year is recomputed per chunk (cheap, identical results) so memory grows with the chunk, not with the number of variables.
+    chunks <- if (!cfg$write_rasters) list(character()) else if (length(mvars)) split(mvars, ceiling(seq_along(mvars) / cfg$monthly_chunk)) else list(character())
     mask_of <- function(v) as.integer(sum(2^(match(v, wb_monthly_vars) - 1L)))
     x <- wb_year(mem, grid, p, tmean, state$soil, state$pack, site,
-                 monthly = mask_of(chunks[[1]]), vpd = vpd)
-    annual_values <- list()
-    prev_snow <- state$snow_autumn
-    next_snow <- NULL
-    # Preserve original annual CWD/AET values exactly as calculated by the engine.
-    if (emit_annual && "cwd" %in% cfg$outputs_to_write) annual_values$cwd <- x[, "cwd"]
-    if (emit_annual && "aet" %in% cfg$outputs_to_write) annual_values$aet <- x[, "aet"]
-    if (emit_annual && "balance" %in% cfg$outputs_to_write) {
-      if (identical(cfg$months_out, 1:12)) {
-        annual_values$balance <- x[, "aet"] - x[, "cwd"]
-      } else {
-        dc <- wb_year(mem, grid, p, tmean, state$soil, state$pack, site,
-                      monthly = as.integer(1L + 2L), vpd = vpd)
-        annual_values$balance <- rowSums(
-          dc[, paste0("aet_m", sprintf("%02d", cfg$months_out)), drop = FALSE] -
-          dc[, paste0("cwd_m", sprintf("%02d", cfg$months_out)), drop = FALSE])
-        rm(dc)
-      }
-    }
-    zrows <- list()
-    next_peak <- NULL
-    collect <- function(dat, chunk) {
-      requested <- intersect(chunk, annual_vars)
-      for (v in requested) {
-        cols <- paste0(v, "_m", sprintf("%02d", 1:12))
-        if (!all(cols %in% colnames(dat))) stop("Missing annual monthly columns: ", v)
-        a <- dat[, cols, drop = FALSE]
-        if (v == "pack") {
-          next_snow <<- rowSums(a[, 9:12, drop = FALSE])
-          if ("snow" %in% cfg$outputs_to_write || "pack" %in% cfg$outputs_to_write) {
-            val <- if (is.null(prev_snow)) rep(NA_real_, nrow(a)) else
-              (prev_snow + rowSums(a[, 1:5, drop = FALSE])) / 9
-            for (nm in intersect(c("snow", "pack"), cfg$outputs_to_write)) annual_values[[nm]] <<- val
-          }
-          if ("snow_peak" %in% cfg$outputs_to_write) {
-            # Peak from preceding autumn requires the previous months' individual states.
-            val <- if (is.null(state$snow_autumn_peak)) rep(NA_real_, nrow(a)) else
-              pmax(state$snow_autumn_peak, apply(a[, 1:5, drop = FALSE], 1, max))
-            annual_values$snow_peak <<- val
-          }
-          next_peak <<- apply(a[, 9:12, drop = FALSE], 1, max)
-        } else if (v == "soil") {
-          annual_values$soil <<- rowMeans(a[, 3:10, drop = FALSE])
-        } else if (!v %in% c("cwd", "aet")) {
-          annual_values[[v]] <<- rowSums(a[, cfg$months_out, drop = FALSE])
-        }
-      }
-      output <- intersect(chunk, mvars)
-      if (length(output)) wb_write_monthly(mem, dat, cfg, yr, output)
-      selected <- intersect(chunk, zvars)
-      if (length(selected)) zrows[[length(zrows) + 1L]] <<- wb_zonal_chunk(dat, selected, zonal, yr, stage)
-    }
-    collect(x, chunks[[1]])
+                 monthly = if (!cfg$write_rasters) all_monthly else mask_of(chunks[[1]]), vpd = vpd)
+    if (cfg$write_rasters) wb_atomic_raster(wb_to_raster(mem, x[, c("cwd", "aet")], c("cwd", "aet")), paths[j], cfg)
+    if (length(chunks[[1]])) wb_write_monthly(mem, x, cfg, yr, chunks[[1]])
     for (ch in chunks[-1]) {
       xc <- wb_year(mem, grid, p, tmean, state$soil, state$pack, site, monthly = mask_of(ch), vpd = vpd)
-      collect(xc, ch); rm(xc); gc(verbose = FALSE)
-    }
-    if (!is.null(zonal) && "balance" %in% cfg$zonal_monthly) {
-      # Derive from paired cell-level monthly values, BEFORE zonal quantiles.
-      # A separate two-variable pass keeps the memory bound independent of other outputs.
-      dx <- wb_year(mem, grid, p, tmean, state$soil, state$pack, site,
-                    monthly = as.integer(1L + 2L), vpd = vpd)
-      # wb_year() returns a fixed-width matrix. Matrix [<- cannot create
-      # additional named columns, so construct a separate derived matrix.
-      months <- sprintf("%02d", 1:12)
-      balance_monthly <- dx[, paste0("aet_m", months), drop = FALSE] -
-        dx[, paste0("cwd_m", months), drop = FALSE]
-      colnames(balance_monthly) <- paste0("balance_m", months)
-      zrows[[length(zrows) + 1L]] <- wb_zonal_chunk(
-        balance_monthly, "balance", zonal, yr, stage)
-      rm(dx); gc(verbose = FALSE)
-    }
-    if (emit_annual) {
-      missing <- setdiff(cfg$outputs_to_write, names(annual_values))
-      if (length(missing)) stop("Annual outputs not collected: ", paste(missing, collapse = ", "))
-      wb_atomic_raster(wb_to_raster(mem, do.call(cbind, annual_values[cfg$outputs_to_write]),
-                                      cfg$outputs_to_write), paths[j], cfg)
-    }
-    if (!is.null(zonal)) {
-      if (!length(zrows)) stop("Zonal analysis has no variables to collect.")
-      wb_save_state(zonal_paths(j)[j], do.call(rbind, zrows))
+      wb_write_monthly(mem, xc, cfg, yr, ch); rm(xc); gc(verbose = FALSE)
     }
     if (!is.null(points)) {
-      if (cfg$write_rasters || !is.null(zonal)) {
+      if (cfg$write_rasters) {
         # Full run: repeat the year on the point cells alone with every monthly variable (same inputs, same state).
         xp <- wb_year(wb_mem_subset(mem, points$sub), wb_grid_subset(grid, points$sub), p, tmean,
                       state$soil[points$sub], state$pack[points$sub], site, awc = mem$awc[points$sub], monthly = all_monthly, vpd = vpd)
@@ -2656,8 +2455,6 @@ wb_run_sequence <- function(site, cfg, index, years, initial, stage, mem, grids,
     }
     if (cfg$diagnostics) print(apply(x, 2, function(v) c(min = min(v, na.rm = TRUE), max = max(v, na.rm = TRUE), mean = mean(v, na.rm = TRUE))))
     state$year <- yr; state$soil <- x[, "soil_end"]; state$pack <- x[, "pack_end"]
-    state$snow_autumn <- next_snow
-    state$snow_autumn_peak <- next_peak
     state$stamp <- wb_file_stamp(stamp_paths(j))
     wb_save_state(state_path, state)
     wb_cleanup_temp(site)
@@ -2667,33 +2464,23 @@ wb_run_sequence <- function(site, cfg, index, years, initial, stage, mem, grids,
 
 wb_summaries <- function(site, cfg, baseline, analysis) {
   old <- wb_enter("Writing final summaries"); on.exit(.wb_log$context <- old, add = TRUE)
-  summary_dir <- file.path(cfg$output_root, "summaries")
-  dir.create(summary_dir, recursive = TRUE, showWarnings = FALSE)
   for (output in cfg$outputs_to_write) {
-    read_band <- function(f) wb_step("Reading annual result for summary", f, terra::rast(f)[[output]])
-    for (stage in if (isTRUE(cfg$write_baseline)) c("baseline", "analysis") else "analysis") {
-      files <- if (stage == "baseline") baseline$paths else analysis$paths
-      years <- if (stage == "baseline") cfg$base_years else cfg$years_annual
-      if (!all(file.exists(files))) stop("Missing ", stage, " yearly raster files: ", paste(files[!file.exists(files)], collapse = ", "))
-      layers <- do.call(c, lapply(files, read_band))
-      names(layers) <- paste0(toupper(output), "_", years)
-      # Retain the original analysis annual brick, unchanged in its usual location.
-      if (stage == "analysis") {
-        path <- file.path(cfg$output_root, paste0(toupper(output), "_", cfg$month_tag, "_mm_", min(years), "_", max(years), ".tif"))
-        wb_atomic_raster(layers, path, cfg)
-        cat("Final stack:", path, "\n")
-      }
-      if (isTRUE(cfg$summarize)) {
-        # Reporting-period means are independent of the spin-up/baseline purpose.
-        # An incomplete first snow year is NA and excluded from the mean;
-        # zero SWE is a valid observation and is included.
-        mean_r <- terra::mean(layers, na.rm = TRUE)
-        names(mean_r) <- paste0(output, "_", stage, "_mean_mm")
-        path <- file.path(summary_dir, paste0(toupper(output), "_mean_", stage, "_", min(years), "_", max(years), ".tif"))
-        wb_atomic_raster(mean_r, path, cfg)
-        wb_note(paste("Period mean:", path))
-      }
-    }
+    read_band <- function(f) wb_step("Reading annual result for summary", f, rast(f)[[output]])
+    wb_enter("Baseline mean", paste(range(cfg$base_years), collapse = "-"), baseline$paths)
+    b <- rast(lapply(baseline$paths, read_band))
+    avg <- mean(b, na.rm = FALSE)
+    names(avg) <- paste0(output, "_baseline_mean_mm")
+    tag <- paste0(toupper(output), "_", cfg$month_tag, "_mm_baseline_",
+                  min(cfg$base_years), "_", max(cfg$base_years), ".tif")
+    wb_atomic_raster(avg, file.path(cfg$output_root, tag), cfg)
+    wb_enter("Annual output stack", paste(range(cfg$years_annual), collapse = "-"), analysis$paths)
+    a <- rast(lapply(analysis$paths, read_band))
+    names(a) <- paste0(toupper(output), "_", cfg$years_annual)
+    path <- file.path(cfg$output_root, paste0(toupper(output), "_", cfg$month_tag, "_mm_",
+                     min(cfg$years_annual), "_", max(cfg$years_annual), ".tif"))
+    wb_atomic_raster(a, path, cfg)
+    wb_note(c(paste("Baseline result:", file.path(cfg$output_root, tag)), paste("Annual result:", path)))
+    cat("Final stack:", path, "\n")
   }
   invisible(TRUE)
 }
@@ -2716,13 +2503,12 @@ wb_main_impl <- function(cfg) {
     site <- wb_add_lapse(site, cfg, index)
     wb_cleanup_temp(site)
     points <- if (!is.null(cfg$points_path)) wb_read_points(cfg, site) else NULL
-    mem <- wb_memory_site(site, cfg, keep_cells = if (!cfg$write_rasters && is.null(cfg$zonal_path) && !is.null(points)) unique(as.vector(points$nb_cells)) else NULL)
+    mem <- wb_memory_site(site, cfg, keep_cells = if (!cfg$write_rasters) unique(as.vector(points$nb_cells)) else NULL)
     mem$static <- wb_memory_static(mem, site, cfg)
     if (!is.null(points)) {
       points <- wb_points_rows(points, mem, cfg)
       cat("Points with modelled cells:", nrow(points$pts), if (!cfg$write_rasters) "(points-only run: no rasters will be written)" else "", "\n")
     }
-    zonal <- if (is.null(cfg$zonal_path)) NULL else wb_zonal_prepare_cached(cfg$zonal_path, cfg$zonal_id_field, mem, cfg)
     write.csv(mem$rad_summary, file.path(site$out_dir, "radiation_summary.csv"), row.names = FALSE)
     cat("Clear-sky radiation on slopes, monthly mean (MJ m-2 d-1):",
         paste(round(mem$rad_summary$clear_sky_slope_MJ_m2_d, 1), collapse = " "), "\n")
@@ -2732,45 +2518,21 @@ wb_main_impl <- function(cfg) {
                sprintf("%.2f", mem$rad_summary$terrain_modifier_p95), ")", collapse = " "), "\n")
     cat("PET method:", cfg$pet_method, "\n")
     grids <- new.env()
-    init_cache <- wb_initialization_cache(cfg, index, site, mem)
-    initial <- wb_cached_baseline(init_cache$path, init_cache$key, mem$n, max(cfg$base_years))
-    # Baseline raster output is an explicit opt-in; cached states cannot replace
-    # those requested historical output products.
-    if (isTRUE(cfg$write_baseline)) initial <- NULL
-    if (is.null(initial)) {
-      spin <- wb_spinup(site, cfg, mem, grids)
-      wb_cleanup_temp(site)
-      if (cfg$pet_diagnostics) wb_pet_check(site, cfg, mem, grids, spin)
-      wb_cleanup_temp(site)
-      baseline <- wb_run_sequence(site, cfg, index, cfg$base_years, spin, "baseline", mem, grids, points, zonal)
-      initial <- baseline$final
-      # Seasonal outputs require preceding autumn snow information. Save it with
-      # the initialized state rather than allowing output selection to erase it.
-      if (!is.null(initial$snow_autumn) && !is.null(initial$snow_autumn_peak)) {
-        cached <- initial
-        cached$key <- init_cache$key
-        cached$stamp <- NULL
-        wb_save_state(init_cache$path, cached)
-        cat("Saved reusable baseline-end state: ", init_cache$path, "\n", sep = "")
-      } else {
-        warning("Initialization state lacks preceding autumn snow history; cache not saved.")
-      }
-    } else {
-      cat("Reusing initialized baseline state from ", init_cache$path, "\n", sep = "")
-      baseline <- list(final = initial, paths = character())
-    }
-    cat("Analysis initialization: continuous from final baseline state\n")
-    analysis <- wb_run_sequence(site, cfg, index, cfg$years_annual, initial, "analysis", mem, grids, points, zonal)
+    spin <- wb_spinup(site, cfg, mem, grids)
+    wb_cleanup_temp(site)
+    if (cfg$pet_diagnostics) wb_pet_check(site, cfg, mem, grids, spin)
+    wb_cleanup_temp(site)
+    baseline <- wb_run_sequence(site, cfg, index, cfg$base_years, spin, "baseline", mem, grids, points)
+    initial <- if (cfg$analysis_initialization == "baseline_end") baseline$final else spin
+    cat("Analysis initialization:", cfg$analysis_initialization, "\n")
+    analysis <- wb_run_sequence(site, cfg, index, cfg$years_annual, initial, "analysis", mem, grids, points)
     if (cfg$write_rasters) { wb_summaries(site, cfg, baseline, analysis); wb_monthly_stacks(cfg) }
     if (!is.null(points)) wb_points_write(cfg, site, points, file.path(site$out_dir, c("baseline_years", "analysis_years")))
-    if (!is.null(zonal)) wb_zonal_export(cfg, site,
-      if (length(baseline$paths)) c("baseline", "analysis") else "analysis", zonal)
     for (f in c("site_metadata.txt", "lapse_coefficients.csv", "radiation_summary.csv", "spinup_status.txt", "spinup_diagnostics.csv")) {
       path <- file.path(site$out_dir, f)
       if (file.exists(path)) wb_note(c(paste("Diagnostics:", f), readLines(path)))
     }
-    # Retain ending states locally for provenance/future extension; remove only
-    # this run's intermediate checkpoint directories after final validation.
+    # Retain ending states locally for provenance/future extension; remove only this run's intermediate checkpoint directories after final validation.
     if (cfg$write_rasters) {
       wb_atomic_raster(wb_to_raster(mem, cbind(baseline$final$soil, baseline$final$pack), c("soil_end", "pack_end")),
         file.path(cfg$run_dir, paste0("state_Dec_", max(cfg$base_years), ".tif")), cfg, "FLT8S")
@@ -2810,327 +2572,4 @@ wb_main <- function(cfg) {
       invokeRestart("muffleWarning")
     },
     error = function(e) wb_condition(e, "ERROR"))
-}
-
-wb_environment_input_signature <- function(path) {
-  path <- normalizePath(path.expand(path), mustWork = TRUE)
-  files <- path
-  if (tolower(tools::file_ext(path)) == "shp") {
-    stem <- tools::file_path_sans_ext(path)
-    files <- Sys.glob(paste0(stem, ".*"))
-  }
-  info <- file.info(files)
-  if (anyNA(info$size) || anyNA(info$mtime)) stop("Cannot fingerprint input: ", path)
-  data.frame(path = normalizePath(files), bytes = as.numeric(info$size),
-             modified = as.numeric(info$mtime), stringsAsFactors = FALSE)
-}
-
-wb_environment_key <- function(cfg, job) {
-  # Keep this independent of output_root, run years, PRISM, and analysis settings.
-  settings <- list(version = 1L,
-    dem = wb_environment_input_signature(cfg$dem_path),
-    awc = wb_environment_input_signature(cfg$awc_path),
-    aoi = if (!is.null(cfg$aoi_bbox)) cfg$aoi_bbox else wb_environment_input_signature(cfg$aoi_path),
-    job_label = job$label,
-    aoi_features_to_run = cfg$aoi_features_to_run,
-    run_aois_separately = cfg$run_aois_separately,
-    aoi_label_field = cfg$aoi_label_field,
-    aggregate = cfg$dem_aggregate_fact, z_units = cfg$dem_z_units,
-    source_crs = cfg$dem_source_crs, metric_crs = cfg$metric_crs,
-    awc_units = cfg$awc_units, awc_depth_mm = cfg$awc_depth_mm)
-  temp <- tempfile(fileext = ".rds")
-  on.exit(unlink(temp), add = TRUE)
-  saveRDS(settings, temp, version = 2)
-  unname(tools::md5sum(temp))
-}
-
-wb_prepare_site <- function(cfg, job) {
-  if (identical(cfg$prepared_environment, FALSE))
-    return(wb_prepare_site_uncached(cfg, job))
-  cache_root <- cfg$environment_cache
-  if (is.null(cache_root) || !nzchar(cache_root))
-    cache_root <- file.path(dirname(normalizePath(cfg$dem_path, mustWork = TRUE)),
-                            ".wbr_prepared_environment")
-  key <- wb_environment_key(cfg, job)
-  dest <- file.path(path.expand(cache_root), key)
-  manifest <- file.path(dest, "manifest.rds")
-  fields <- c("dem", "SOILmax", "HL", "slope_rad", "aspect_deg", "latitude")
-  raster_paths <- file.path(dest, paste0(fields, ".tif"))
-  if (file.exists(manifest) && all(file.exists(raster_paths))) {
-    meta <- tryCatch(readRDS(manifest), error = function(e) NULL)
-    if (is.list(meta) && identical(meta$key, key) &&
-        identical(meta$fields, fields)) {
-      site <- meta$site
-      loaded <- tryCatch(lapply(raster_paths, terra::rast), error = function(e) NULL)
-      if (!is.null(loaded) && all(vapply(loaded, function(x) terra::nlyr(x) == 1L, logical(1)))) {
-        names(loaded) <- fields
-        site[fields] <- loaded
-        site$out_dir <- cfg$run_dir
-        dir.create(site$out_dir, recursive = TRUE, showWarnings = FALSE)
-        writeLines(capture.output(str(meta$metadata)), file.path(site$out_dir, "site_metadata.txt"))
-        saveRDS(meta$metadata, file.path(site$out_dir, "site_metadata.rds"))
-        cat("Reusing prepared geography: ", dest, "\n", sep = "")
-        return(site)
-      }
-    }
-  }
-  site <- wb_prepare_site_uncached(cfg, job)
-  dir.create(dest, recursive = TRUE, showWarnings = FALSE)
-  # Write files before publishing the manifest. An interrupted write is never
-  # treated as a completed cache entry.
-  for (i in seq_along(fields)) {
-    tmp <- tempfile(pattern = paste0(fields[i], "_"), tmpdir = dest, fileext = ".tif")
-    terra::writeRaster(site[[fields[i]]], tmp, overwrite = TRUE,
-                       wopt = list(datatype = "FLT8S", gdal = cfg$gdal_opts))
-    if (file.exists(raster_paths[i])) unlink(raster_paths[i])
-    if (!file.rename(tmp, raster_paths[i])) stop("Cannot finalize prepared raster: ", raster_paths[i])
-  }
-  metadata <- readRDS(file.path(site$out_dir, "site_metadata.rds"))
-  saved <- site
-  saved[fields] <- NULL
-  meta <- list(key = key, fields = fields, site = saved, metadata = metadata)
-  tmp_manifest <- tempfile(pattern = "manifest_", tmpdir = dest, fileext = ".rds")
-  saveRDS(meta, tmp_manifest)
-  if (file.exists(manifest)) unlink(manifest)
-  if (!file.rename(tmp_manifest, manifest)) stop("Cannot finalize prepared environment manifest")
-  cat("Saved reusable prepared geography: ", dest, "\n", sep = "")
-  site
-}
-
-# Persistent zone-to-model-cell mapping. Output selections, years, and PET method
-# do not enter the key; changes to source geometry or grid/mask do.
-wb_zonal_prepare_cached <- function(zones, id_field, mem, cfg) {
-  # In-memory zone objects have no reliable persistent identity: prepare normally.
-  if (!is.character(zones) || length(zones) != 1L || !file.exists(path.expand(zones)))
-    return(wb_zonal_prepare(zones, id_field, mem))
-  source_path <- normalizePath(path.expand(zones), mustWork = TRUE)
-  # Ordinary local paths and shapefile sidecars are included in the signature.
-  signature <- wb_environment_input_signature(source_path)
-  template <- mem$template
-  geometry <- list(crs = terra::crs(template), extent = as.vector(terra::ext(template)),
-                   resolution = terra::res(template), nrow = terra::nrow(template),
-                   ncol = terra::ncol(template))
-  root <- cfg$environment_cache
-  if (is.null(root) || !length(root) || !nzchar(root))
-    root <- file.path(dirname(normalizePath(cfg$dem_path, mustWork = TRUE)),
-                      ".wbr_prepared_environment")
-  dest <- file.path(path.expand(root), "zonal_mappings")
-  dir.create(dest, recursive = TRUE, showWarnings = FALSE)
-  # Hash the actual engine-cell ordering. Identical grid geometry alone does not
-  # guarantee identical modeled cells, particularly with changes to soil masks.
-  mask_file <- tempfile("wb_zone_cells_", tmpdir = dest, fileext = ".bin")
-  on.exit(unlink(mask_file), add = TRUE)
-  con <- file(mask_file, "wb")
-  writeBin(as.double(mem$cells), con, size = 8L)
-  close(con)
-  mask_md5 <- unname(tools::md5sum(mask_file))
-  payload <- list(version = 1L, source = signature, id_field = id_field,
-                  geometry = geometry, mask_md5 = mask_md5,
-                  assignment = "terra_cell_center_last_polygon_wins")
-  keyfile <- tempfile("wb_zone_key_", tmpdir = dest, fileext = ".rds")
-  on.exit(unlink(keyfile), add = TRUE)
-  saveRDS(payload, keyfile, version = 2)
-  key <- unname(tools::md5sum(keyfile))
-  path <- file.path(dest, paste0(key, ".rds"))
-  if (file.exists(path)) {
-    cached <- tryCatch(readRDS(path), error = function(e) NULL)
-    if (is.list(cached) && identical(cached$key, key) &&
-        is.list(cached$mapping) && length(cached$mapping$group) == mem$n &&
-        is.data.frame(cached$mapping$meta) &&
-        all(c("zone_id", "zone_label", "n_zone_cells") %in% names(cached$mapping$meta)) &&
-        sum(cached$mapping$meta$n_zone_cells) == sum(!is.na(cached$mapping$group))) {
-      cat("Reusing zonal cell mapping: ", path, "\n", sep = "")
-      return(cached$mapping)
-    }
-    warning("Zonal mapping cache failed validation; rebuilding: ", path)
-  }
-  mapping <- wb_zonal_prepare(zones, id_field, mem)
-  tmp <- tempfile("wb_zone_mapping_", tmpdir = dest, fileext = ".rds")
-  on.exit(unlink(tmp), add = TRUE)
-  saveRDS(list(key = key, mapping = mapping), tmp, compress = TRUE)
-  # Publish only complete mappings. Another process may already have written
-  # an equivalent mapping; renaming safely replaces that cache entry.
-  if (file.exists(path)) unlink(path)
-  if (!file.rename(tmp, path)) warning("Could not retain zonal cache: ", path)
-  else cat("Cached zonal cell mapping: ", path, "\n", sep = "")
-  mapping
-}
-
-wb_zonal_prepare <- function(zones, id_field, mem) {
-  if (is.character(zones)) zones <- if (tolower(tools::file_ext(zones)) %in%
-      c("tif", "tiff", "vrt", "grd", "img", "nc")) terra::rast(zones) else terra::vect(zones)
-  if (!inherits(zones, c("SpatRaster", "SpatVector"))) stop("ZONAL_PATH must be a raster or vector.")
-  template <- mem$template
-  if (inherits(zones, "SpatRaster")) {
-    if (terra::nlyr(zones) != 1L) stop("Zonal raster must have exactly one layer.")
-    categories <- tryCatch(terra::cats(zones)[[1]], error = function(e) NULL)
-    zid <- terra::project(zones, template, method = "near")
-    values <- terra::values(zid, mat = FALSE)[mem$cells]
-    if (any(is.finite(values) & values != floor(values))) stop("Zonal rasters require integer category codes.")
-    id <- as.character(values)
-    label_lookup <- if (!is.null(categories) && ncol(categories) >= 2L)
-      setNames(as.character(categories[[2]]), as.character(categories[[1]])) else NULL
-  } else {
-    if (!terra::same.crs(zones, template)) zones <- terra::project(zones, template)
-    typ <- terra::geomtype(zones)
-    ids <- if (is.null(id_field)) as.character(seq_len(nrow(zones))) else {
-      if (!id_field %in% names(zones)) stop("ZONAL_ID_FIELD not found: ", id_field)
-      as.character(terra::values(zones)[[id_field]])
-    }
-    if (anyNA(ids) || any(!nzchar(ids))) stop("Missing or blank zone identifiers.")
-    if (identical(typ, "polygons")) {
-      # Overlapping polygons: the last feature wins, matching terra::rasterize.
-      zones$wb_zone_code <- match(ids, unique(ids))
-      zid <- terra::rasterize(zones, template, field = "wb_zone_code", touches = FALSE)
-      codes <- terra::values(zid, mat = FALSE)[mem$cells]
-      id <- unique(ids)[codes]
-    } else if (identical(typ, "points")) {
-      cells <- terra::cellFromXY(template, terra::crds(zones))
-      ids_by_cell <- rep(NA_character_, terra::ncell(template))
-      # Multiple points in a model cell are different sampling units; disallow ambiguity.
-      if (anyDuplicated(cells[!is.na(cells)])) stop("Multiple zonal points share a model cell; use POINTS_PATH for overlapping point samples.")
-      ids_by_cell[cells[!is.na(cells)]] <- ids[!is.na(cells)]
-      id <- ids_by_cell[mem$cells]
-    } else stop("Zonal vectors must contain points or polygons.")
-    label_lookup <- NULL
-  }
-  good <- !is.na(id) & nzchar(id) & id != "NA"
-  labels <- unique(id[good])
-  if (!length(labels)) stop("No modeled cells intersect ZONAL_PATH.")
-  group <- match(id, labels)
-  meta <- data.frame(zone_id = labels, zone_label = labels,
-                     n_zone_cells = tabulate(group[good], nbins = length(labels)),
-                     stringsAsFactors = FALSE)
-  if (!is.null(label_lookup)) {
-    l <- label_lookup[meta$zone_id]
-    meta$zone_label[!is.na(l)] <- l[!is.na(l)]
-  }
-  list(group = group, meta = meta)
-}
-
-wb_zonal_chunk <- function(x, vars, zonal, year, stage) {
-  out <- vector("list", length(vars) * 12L); k <- 0L
-  group <- zonal$group; ng <- nrow(zonal$meta)
-  for (v in vars) for (m in 1:12) {
-    col <- paste0(v, "_m", sprintf("%02d", m))
-    if (!col %in% colnames(x)) stop("Missing zonal monthly result: ", col)
-    value <- x[, col]
-    valid <- which(!is.na(group) & is.finite(value))
-    sums <- numeric(ng); sumsq <- numeric(ng); counts <- integer(ng)
-    if (length(valid)) {
-      z <- rowsum(value[valid], group[valid], reorder = TRUE)
-      n <- tabulate(group[valid], nbins = ng)
-      sums[as.integer(rownames(z))] <- z[, 1]
-      z2 <- rowsum(value[valid]^2, group[valid], reorder = TRUE)
-      sumsq[as.integer(rownames(z2))] <- z2[, 1]
-      counts <- n
-    }
-    # Sample spatial variance (n - 1), computed from the cell-level
-    # first and second moments. Never confuse temporal variability with
-    # within-zone spatial variability; zero-valued snow is valid.
-    mn <- ifelse(counts > 0L, sums / pmax(counts, 1L), NA_real_)
-    spatial_var <- rep(NA_real_, ng)
-    many <- which(counts > 1L)
-    spatial_var[many] <- pmax(0, (sumsq[many] - sums[many]^2 / counts[many]) / (counts[many] - 1L))
-    spatial_sd <- sqrt(spatial_var)
-    spatial_cv <- ifelse(is.finite(mn) & abs(mn) > 0, spatial_sd / abs(mn), NA_real_)
-    # Exact spatial extrema over valid modeled cells, without sorting or quantiles.
-    spatial_min <- spatial_max <- rep(NA_real_, ng)
-    if (length(valid)) {
-      # Group-wise extrema; independent of zone geometry and order.
-      extrema <- lapply(split(value[valid], group[valid]), range)
-      idx <- as.integer(names(extrema))
-      spatial_min[idx] <- vapply(extrema, `[`, numeric(1), 1L)
-      spatial_max[idx] <- vapply(extrema, `[`, numeric(1), 2L)
-    }
-    k <- k + 1L
-    out[[k]] <- data.frame(zone_id = zonal$meta$zone_id, zone_label = zonal$meta$zone_label,
-      stage = stage, year = year, month = m, variable = v,
-      mean = mn, spatial_min = spatial_min, spatial_max = spatial_max,
-      spatial_sd = spatial_sd, spatial_variance = spatial_var, spatial_cv = spatial_cv,
-      n_cells = counts, n_zone_cells = zonal$meta$n_zone_cells,
-      coverage = ifelse(zonal$meta$n_zone_cells > 0, counts / zonal$meta$n_zone_cells, NA_real_))
-  }
-  do.call(rbind, out)
-}
-
-wb_zonal_annual <- function(monthly) {
-  if (is.null(monthly) || !nrow(monthly)) return(NULL)
-  flux <- c("cwd", "aet", "balance", "pet", "water", "ppt", "snowfall", "melt", "runoff")
-  key <- interaction(monthly$zone_id, monthly$year, monthly$stage, monthly$variable, drop = TRUE)
-  parts <- split(monthly, key)
-  do.call(rbind, lapply(parts, function(d) {
-    if (nrow(d) != 12L || any(!is.finite(d$mean))) val <- NA_real_
-    else val <- if (d$variable[1] %in% flux) sum(d$mean) else mean(d$mean)
-    data.frame(zone_id = d$zone_id[1], zone_label = d$zone_label[1], stage = d$stage[1],
-      year = d$year[1], variable = d$variable[1], mean = val,
-      n_cells = min(d$n_cells), n_zone_cells = d$n_zone_cells[1],
-      coverage = min(d$coverage), temporal_stat = if (d$variable[1] %in% flux) "sum" else "mean")
-  }))
-}
-
-wb_zonal_climatology <- function(monthly) {
-  if (is.null(monthly) || !nrow(monthly)) return(NULL)
-  d <- monthly[monthly$stage == "analysis", , drop = FALSE]
-  if (!nrow(d)) return(NULL)
-  key <- interaction(d$zone_id, d$month, d$variable, drop = TRUE)
-  parts <- split(d, key)
-  do.call(rbind, lapply(parts, function(x) {
-    ok <- is.finite(x$mean)
-    sd_valid <- function(v) if (sum(is.finite(v)) > 1L) stats::sd(v[is.finite(v)]) else NA_real_
-    avg_valid <- function(v) if (any(is.finite(v))) mean(v[is.finite(v)]) else NA_real_
-    data.frame(zone_id = x$zone_id[1], zone_label = x$zone_label[1],
-      month = x$month[1], variable = x$variable[1],
-      mean = avg_valid(x$mean), temporal_sd = sd_valid(x$mean),
-      temporal_variance = if (sum(ok) > 1L) stats::var(x$mean[ok]) else NA_real_,
-      temporal_min = if (any(ok)) min(x$mean[ok]) else NA_real_,
-      temporal_max = if (any(ok)) max(x$mean[ok]) else NA_real_,
-      mean_spatial_min = avg_valid(x$spatial_min),
-      mean_spatial_max = avg_valid(x$spatial_max),
-      mean_spatial_sd = avg_valid(x$spatial_sd),
-      mean_spatial_variance = avg_valid(x$spatial_variance),
-      mean_spatial_cv = avg_valid(x$spatial_cv),
-      n_years = sum(ok), n_zone_cells = x$n_zone_cells[1],
-      mean_coverage = avg_valid(x$coverage),
-      year_start = if (any(ok)) min(x$year[ok]) else NA_integer_,
-      year_end = if (any(ok)) max(x$year[ok]) else NA_integer_)
-  }))
-}
-
-wb_zonal_export <- function(cfg, site, stages, zonal) {
-  dest <- file.path(cfg$output_root, "zonal")
-  dir.create(dest, recursive = TRUE, showWarnings = FALSE)
-  meta <- zonal$meta
-  utils::write.csv(meta, file.path(dest, "zonal_metadata.csv"), row.names = FALSE)
-  files <- unlist(lapply(stages, function(st) {
-    d <- file.path(site$out_dir, paste0(st, "_years"))
-    file.path(d, paste0("zonal_", if (st == "baseline") cfg$base_years else cfg$years_annual, ".rds"))
-  }))
-  missing <- files[!file.exists(files)]
-  if (length(missing)) stop("Missing zonal year checkpoints: ", paste(missing, collapse = ", "))
-  monthly <- do.call(rbind, lapply(files, readRDS))
-  if (length(cfg$zonal_monthly))
-    utils::write.csv(monthly, file.path(dest, "zonal_monthly.csv"), row.names = FALSE)
-  if (isTRUE(cfg$zonal_annual))
-    utils::write.csv(wb_zonal_annual(monthly), file.path(dest, "zonal_annual.csv"), row.names = FALSE)
-  if (length(cfg$zonal_monthly))
-    utils::write.csv(wb_zonal_climatology(monthly), file.path(dest, "zonal_monthly_climatology.csv"), row.names = FALSE)
-  writeLines(c("In-memory model summaries, not summaries of saved raster files.",
-    "Monthly mean is the spatial mean of each modeled month's cell values.",
-    "Annual fluxes are sums of monthly spatial means; states/temperature/radiation are means of monthly spatial means.",
-    "Soil and snowpack are end-of-month states; rs and rnet are daily radiation rates.",
-    "n_zone_cells is the number of modeled cells assigned to each zone.",
-    "n_cells is the number of valid cells; coverage is their ratio.",
-    "Monthly spatial_sd and spatial_variance are sample dispersion across valid modeled cells within each zone/month (n-1 denominator).",
-    "Monthly spatial_min and spatial_max are the extrema across valid modeled cells within each zone/month/year.",
-    "Monthly spatial_cv is spatial_sd / abs(mean); undefined where zone mean is zero.",
-    "Climatology mean_spatial_min and mean_spatial_max average the annual spatial extrema (mean spatial envelope, not overall space-time extrema).",
-    "zonal_monthly_climatology.csv uses analysis years only: mean is the average monthly zone mean across years.",
-    "temporal_min/temporal_max are extrema of yearly monthly zone means for a calendar month; temporal_sd/temporal_variance describe interannual variability. Mean spatial extrema/dispersion describe within-zone spatial variation.",
-    "Annual zonal spatial variance is not inferred from monthly variances, because cross-month cell covariance is needed.",
-    "Polygons use cell-center assignment; overlapping polygons use last-feature assignment.",
-    "Zones are evaluated only on modeled cells. Points use the containing cell.",
-    "An incomplete twelve-month series produces NA for its annual value."), file.path(dest, "README.txt"))
-  cat("In-memory zonal CSV results:", dest, "\n")
-  invisible(dest)
 }

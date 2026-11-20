@@ -9,6 +9,12 @@ AOI_BBOX <- NULL                # v5.4: set to c(xmin, xmax, ymin, ymax) in deci
                                 # validate_snow_snotel.R picks up the stations inside it. The box is part of the run
                                 # fingerprint, so give each block its own OUTPUT_ROOT.
 AWC_PATH <- "/YOUR PATH/POLARIS_AWC_western_states.tif"
+AWC_CONSTANT_MM <- NULL
+AWC_DEPTH_PATH <- NULL
+AWC_DEPTH_UNITS <- "cm"
+AWC_RESAMPLE <- "bilinear"
+AWC_SOURCE <- ""
+AWC_VERSION <- ""
 PRISM_ROOT <- "/YOUR PATH"
 PRISM_RES <- "800m"
 PRISM_MODE <- "full"   # "full": existing archive; "subset": compact buffered AOI cache; "local": no downloads
@@ -169,6 +175,7 @@ ANALYSIS_INITIALIZATION <- "baseline_end"
 
 # ---- Execution ----
 RESUME <- TRUE
+PRISM_CHECK_RESIDENT <- FALSE
 ALLOW_DOWNLOADS <- TRUE       # Only missing PRISM months; existing cache files are retained.
 DIAGNOSTICS <- FALSE          # TRUE retains local checkpoints/maps after success; FALSE cleans them up.
 STOP_AFTER_SETUP <- FALSE     # TRUE checks DEM/AOI/AWC only, with no climate download/year loop.
@@ -211,6 +218,9 @@ cfg <- list(
   aoi_label_field = AOI_LABEL_FIELD, dem_aggregate_fact = DEM_AGGREGATE_FACT,
   dem_z_units = DEM_Z_UNITS, metric_crs = METRIC_CRS, dem_source_crs = DEM_SOURCE_CRS,
   awc_units = AWC_UNITS, awc_depth_mm = AWC_DEPTH_MM,
+  awc_constant_mm = AWC_CONSTANT_MM, awc_depth_path = AWC_DEPTH_PATH,
+  awc_depth_units = AWC_DEPTH_UNITS, awc_resample = AWC_RESAMPLE,
+  awc_source = AWC_SOURCE, awc_version = AWC_VERSION,
   lapse_window_km = LAPSE_WINDOW_KM, lapse_t_limits = LAPSE_T_LIMITS, lapse_p_limits = LAPSE_P_LIMITS,
   spinup_max_iter = SPINUP_MAX_ITER, soil_tol_mm = SOIL_TOL_MM, pack_tol_mm = PACK_TOL_MM,
   spinup_max_pct = SPINUP_MAX_PCT, spinup_action = SPINUP_ACTION,
@@ -229,7 +239,7 @@ cfg <- list(
   write_rasters = WRITE_RASTERS,
   zonal_path = ZONAL_PATH, zonal_id_field = ZONAL_ID_FIELD,
   zonal_monthly = ZONAL_MONTHLY, zonal_annual = ZONAL_ANNUAL, zonal_plots = ZONAL_PLOTS,
-  resume = RESUME, allow_downloads = ALLOW_DOWNLOADS, diagnostics = DIAGNOSTICS,
+  resume = RESUME, allow_downloads = ALLOW_DOWNLOADS, prism_check_resident = PRISM_CHECK_RESIDENT, diagnostics = DIAGNOSTICS,
   stop_after_setup = STOP_AFTER_SETUP, lapse_seed = LAPSE_SEED, wb_cores = WB_CORES,
   terra_memfrac = TERRA_MEMFRAC, proj_data_dir = PROJ_DATA_DIR, gdal_data_dir = GDAL_DATA_DIR, proj_network = PROJ_NETWORK,
   gdal_opts = GDAL_OPTS,

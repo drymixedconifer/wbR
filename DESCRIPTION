@@ -1,6 +1,6 @@
 Package: wbR
 Title: Spatial Water and Energy Balance Model
-Version: 1.1.0.9000
+Version: 1.1.1.9000
 Authors@R: c(
     person("James", "Johnston", role = "aut",
            comment = c(affiliation = "University of Oregon")),
@@ -8,7 +8,7 @@ Authors@R: c(
            email = "drymixedconifer@gmail.com",
            comment = c(affiliation = "New Mexico Forest and Watershed Restoration Institute"))
     )
-Description: Development interface for the v5.5 spatial water-balance engine,
+Description: Development interface for the v6.3 spatial water-balance engine,
     retaining the scientific model as an independently editable R source file.
     Supports optional in-simulation monthly zonal time series.
 URL: https://github.com/drymixedconifer/wbR
