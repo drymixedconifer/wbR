@@ -37,17 +37,16 @@ fut_find_nc <- function(fut, model) {
                             "; found ", length(f), ". Files are named <MODEL>_<scenario>_monthly_<first>-<last>_west.nc.")
   f
 }
+
+# Read a variable's NetCDF units attribute. terra::units() is not a SpatRaster method.
 fut_nc_units <- function(path, variable) {
   nc <- ncdf4::nc_open(path)
-  on.exit(ncdf4::nc_close(nc))
-
+  on.exit(ncdf4::nc_close(nc), add = TRUE)
   att <- ncdf4::ncatt_get(nc, variable, "units")
-
-  if (!isTRUE(att$hasatt))
-    stop("Missing units attribute for ", variable)
-
-  att$value
+  if (!isTRUE(att$hasatt)) stop("Missing NetCDF units attribute for ", variable, ": ", path)
+  as.character(att$value)
 }
+
 # Open the three variables, check units and the monthly calendar, put the grid on -180..180 and crop to the site.
 fut_open <- function(path, model, site, cfg) {
   old <- wb_enter("Opening LOCA2 file", "not applicable", path); on.exit(.wb_log$context <- old, add = TRUE)
@@ -260,10 +259,10 @@ fut_summaries <- function(cfg, fut, model, mode, baseline, analysis) {
   for (o in cfg$outputs_to_write) {
     a <- rast(lapply(paths, function(f) wb_step("Reading annual result for summary", f, rast(f)[[o]])))
     names(a) <- paste0(toupper(o), "_", years)
-    ref <- mean(a[[which(years %in% cfg$base_years)]], na.rm = FALSE)
+    ref <- terra::app(a[[which(years %in% cfg$base_years)]], fun = "mean", na.rm = FALSE)
     out <- ref; nm <- paste0(o, "_mean_", fut_period_tag(range(cfg$base_years)))
     for (p in fut$future_periods) {
-      m <- mean(a[[which(years >= p[1] & years <= p[2])]], na.rm = FALSE)
+      m <- terra::app(a[[which(years >= p[1] & years <= p[2])]], fun = "mean", na.rm = FALSE)
       out <- c(out, m, m - ref)
       nm <- c(nm, paste0(o, c("_mean_", "_change_"), fut_period_tag(p)))
     }
@@ -292,8 +291,15 @@ fut_ensemble <- function(cfg, fut) {
     out <- NULL; nm <- character()
     for (l in layers) {
       s <- rast(lapply(x, function(r) r[[l]]))
-      out <- if (is.null(out)) mean(s, na.rm = FALSE) else c(out, mean(s, na.rm = FALSE)); nm <- c(nm, paste0(l, "_model_mean"))
-      if (grepl("_change_", l)) { out <- c(out, min(s, na.rm = FALSE), max(s, na.rm = FALSE)); nm <- c(nm, paste0(l, c("_model_min", "_model_max"))) }
+      avg <- terra::app(s, fun = "mean", na.rm = FALSE)
+      out <- if (is.null(out)) avg else c(out, avg)
+      nm <- c(nm, paste0(l, "_model_mean"))
+      if (grepl("_change_", l)) {
+        lo <- terra::app(s, fun = "min", na.rm = FALSE)
+        hi <- terra::app(s, fun = "max", na.rm = FALSE)
+        out <- c(out, lo, hi)
+        nm <- c(nm, paste0(l, c("_model_min", "_model_max")))
+      }
     }
     names(out) <- nm
     path <- file.path(cfg$output_root, "ensemble", mode, sprintf("%s_%s_mm_ensemble_%s_%s_period_means.tif", toupper(o), cfg$month_tag, fut$scenario, mode))
