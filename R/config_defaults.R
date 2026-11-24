@@ -1,7 +1,7 @@
 # Generated from inst/config/defaults.R. Keep synchronized with that source.
 # Installed-package configuration does not depend on system.file() lookups.
 .wbr_config_defaults <- function(.wb_functions_path) {
-  # Original v5.5 driver settings, retained verbatim. Edit values via wb_config() or a project script.
+  # Default settings for the v6.4 engine. Edit values via wb_config() or a project script.
   # ---- Paths and study settings ----
   BASE_DIR <- "/YOUR PATH"
   DEM_PATH <- file.path(BASE_DIR, "western_us_dem_500m.tif")
@@ -11,7 +11,7 @@
                                   # Useful for calibration blocks: run a box with different snow settings and
                                   # validate_snow_snotel.R picks up the stations inside it. The box is part of the run
                                   # fingerprint, so give each block its own OUTPUT_ROOT.
-  AWC_PATH <- "/YOUR PATH/POLARIS_AWC_western_states.tif"
+  AWC_PATH <- file.path(BASE_DIR, "POLARIS_AWC_western_states.tif")
   AWC_CONSTANT_MM <- NULL
   AWC_DEPTH_PATH <- NULL
   AWC_DEPTH_UNITS <- "cm"
@@ -30,13 +30,13 @@
   PREPARED_ENVIRONMENT <- TRUE     # Reuse static DEM, slope, aspect, heat load, latitude, and soil grids.
   ENVIRONMENT_CACHE <- NULL       # NULL: hidden cache beside the input DEM; set a shared directory explicitly.
   
-  BASE_YEARS <- 1948:1949        # Warm-up after spin-up; the baseline-mean rasters will be a 2-year average.
+  BASE_YEARS <- 1948:1949        # Warm-up after spin-up; baseline-mean rasters (WRITE_BASELINE) average these years.
   YEARS_ANNUAL <- 1950:2025
   MONTHS_OUT <- 1:12
-  OUTPUTS_TO_WRITE <- c("cwd", "aet")
+  OUTPUTS_TO_WRITE <- c("cwd", "aet")   # Any of: cwd, aet, pet, ppt, soil, pack, snow, snow_peak, melt, runoff, snowfall, water, balance
   SUMMARIZE <- FALSE # No period means unless requested
-    WRITE_BASELINE <- FALSE # Baseline used for initialization only
-  RUN_AOIS_SEPARATELY <- FALSE   # Required for this flat layout (one combined geography).
+  WRITE_BASELINE <- FALSE # Baseline used for initialization only
+  RUN_AOIS_SEPARATELY <- FALSE   # TRUE: one run per AOI feature (see AOI_FEATURES_TO_RUN, AOI_LABEL_FIELD); FALSE: one combined run.
   AOI_FEATURES_TO_RUN <- "all"
   AOI_LABEL_FIELD <- "name"
   
@@ -77,8 +77,14 @@
   MELT_MM_PER_MJ <- 2.3              # Energy method only: mm of melt per MJ m-2 of net radiation (fitted 2.26; 3.0 = complete conversion).
   SNOW_ALBEDO <- 0.77                # Energy method only: snow-surface albedo (fitted 0.77; fresh 0.8-0.9, old/melting 0.5-0.6).
   MELT_RADIATION_WEIGHT <- 0.6       # Degree-day method only: share of the melt factor scaled with slope radiation (0 = plain 5.2 degree-day).
-  SNOW_COVER_DEMAND <- "exclude"
-  SNOW_COVER_MIN_MM <- 10
+  
+  # ---- Snow-cover suppression of soil demand (new in 6.1) ----
+  # "exclude" (6.1 default): the snow-covered share of the month (estimated from available SWE and potential melt)
+  # is removed from the soil/plant demand, so AET + CWD can be lower than reported PET. "soil": the 4.0-6.0
+  # bookkeeping, with the full demand always drawn from the soil; use it for controlled comparisons with v6.0.
+  SNOW_COVER_DEMAND <- "exclude"     # "exclude" or "soil" (the engine stops on anything else).
+  SNOW_COVER_MIN_MM <- 10            # mm SWE: snow available in the month below this does not count as cover.
+  
   # ---- Points (new in 5.5) ----
   # Monthly and annual values at a set of points, written as CSV (<OUTPUT_ROOT>/points/points_monthly.csv and
   # points_annual.csv, with a README). Points come from a CSV with longitude/latitude columns (WGS84 decimal
@@ -113,7 +119,7 @@
                                      # identical results), so memory stays at about 450 + 96 x MONTHLY_CHUNK bytes per cell
                                      # whatever the length of MONTHLY_OUTPUT (West at 500 m: ~15 GB with 4, ~31 GB with 12).
   MONTHLY_DATATYPE <- "INT2S"        # "INT2S": whole millimetres, 5-10x smaller than Float32 (snowpack is mostly zero); "FLT4S": full precision.
-                                     # zero); "FLT4S": full precision. INT2S is right for anything larger than a watershed.
+                                     # INT2S is right for anything larger than a watershed.
   MONTHLY_STACK <- FALSE             # TRUE also writes one 12 x N-layer file per variable (large; e.g. 25 years at 30 m
                                      # over the Malheur is about 10 GB per variable). Per-year files are always written.
   # Files: <OUTPUT_ROOT>/monthly/<VAR>_monthly_<unit>_<year>.tif (unit mm, C or MJm2d), 12 layers named VAR_year_month. Monthly values
@@ -173,9 +179,11 @@
   # More iterations may help slowly stabilizing soil/snow but cannot guarantee equilibrium where this model accumulates snow indefinitely.
   
   ANALYSIS_INITIALIZATION <- "baseline_end"
-  # Recommended for your contiguous periods: Dec 2000 states -> Jan 2001.
-  # Set "equilibrium" to reproduce v2.2's deliberate reset between the periods.
-  # baseline_end rejects gaps and overlaps rather than silently skipping years.
+  # "baseline_end": the analysis starts from the soil and snow state at the end of the baseline
+  #   (December of the last baseline year -> January of the first analysis year).
+  # "equilibrium": the analysis starts from the equilibrium spin-up state instead (v2.2 behaviour);
+  #   not allowed together with the snow / snow_peak annual outputs (they need the preceding autumn's snow).
+  # baseline_end rejects gaps and overlaps between BASE_YEARS and YEARS_ANNUAL rather than silently skipping years.
   
   # ---- Execution ----
   RESUME <- TRUE
@@ -192,8 +200,8 @@
   MEMORY_LIMIT_GB <- NA           # NA: stop if the in-memory engine would exceed 80% of physical RAM (macOS); or a number of GB.
   # The engine holds about 450 bytes per modeled cell (e.g. 75 million 10-m cells = 32 GB). If the estimate
   # printed at startup is too large, raise DEM_AGGREGATE_FACT (3 -> about 30 m) or shrink the AOI.
-  PROJ_DATA_DIR <- "/opt/homebrew/share/proj"
-  GDAL_DATA_DIR <- "/opt/homebrew/share/gdal"
+  PROJ_DATA_DIR <- if (dir.exists("/opt/homebrew/share/proj")) "/opt/homebrew/share/proj" else ""   # "" leaves terra's own PROJ data alone.
+  GDAL_DATA_DIR <- if (dir.exists("/opt/homebrew/share/gdal")) "/opt/homebrew/share/gdal" else ""   # Set explicitly on a non-Homebrew install if needed.
   PROJ_NETWORK <- FALSE        # Use installed datum grids; avoid failed on-demand downloads.
   GDAL_OPTS <- c("COMPRESS=LZW", "PREDICTOR=3", "TILED=YES", "BIGTIFF=IF_SAFER")
   # Each finished year writes its CWD/AET raster and one restart file holding the
@@ -206,7 +214,7 @@
   # Changing years changes filenames. Repeating the same months/years replaces
   # those result rasters; the report appends a dated run record. No AOI names are used.
   
-  # v6 atmospheric inputs (all other original package controls remain unchanged)
+  # v6 atmospheric inputs
   WIND_PATH <- NULL
   WIND_CONSTANT <- 2.0
   AERO_SCALE <- 1.0

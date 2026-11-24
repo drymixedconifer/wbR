@@ -11,7 +11,7 @@
 Where temperature and precipitation describe climate inputs, water balance describes their consequences: the water delivered to a landscape, the energy available to evaporate it, what can be stored, and where atmospheric demand remains unmet.
 
 **Authors:** James Johnston (University of Oregon) and Andreas Wion (New Mexico Forest and Watershed Restoration Institute).  
-**Software version:** `1.1.0.9000` (development). **Scientific implementation:** v6.1.  
+**Software version:** `1.1.0.9000` (development). **Scientific implementation:** v6.4 (snow-cover demand introduced in v6.1).  
 **Status:** Under active testing. The v6.1 snow-cover formulation changes scientific results relative to v6.0; validate outputs before use in publications or management decisions.
 
 ---

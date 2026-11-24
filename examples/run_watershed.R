@@ -16,6 +16,6 @@ cfg$zonal_monthly <- c("cwd", "aet", "pet", "ppt", "water",
                         "soil", "pack", "snowfall", "melt", "tmean")
 cfg$zonal_annual <- TRUE
 cfg$outputs_to_write <- c("cwd", "aet")
-cfg$write_rasters <- TRUE  # required by v5.5 for full-grid runs
+cfg$write_rasters <- TRUE  # TRUE writes the annual rasters; FALSE (with points_path) runs only the point cells
 
 wb_run(cfg)
