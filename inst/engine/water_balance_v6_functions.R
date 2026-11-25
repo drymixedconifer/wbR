@@ -2947,7 +2947,7 @@ wb_environment_input_signature <- function(path) {
 
 wb_environment_key <- function(cfg, job) {
   # Keep this independent of output_root, run years, PRISM, and analysis settings.
-  settings <- list(version = 2L,   # v6.4: soil options added (constant storage, depth raster, resampling)
+  settings <- list(version = 3L,   # v6.4: soil options added (constant storage, depth raster, resampling)
     dem = wb_environment_input_signature(cfg$dem_path),
     awc = if (is.null(cfg$awc_path)) NULL else wb_environment_input_signature(cfg$awc_path),
     awc_depth = if (is.null(cfg$awc_depth_path)) NULL else wb_environment_input_signature(cfg$awc_depth_path),
