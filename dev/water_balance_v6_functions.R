@@ -1704,7 +1704,7 @@ wb_depth_raster <- function(cfg, a, dem) {
   d <- wb_step("Opening AWC depth raster", cfg$awc_depth_path, rast(cfg$awc_depth_path))
   if (nlyr(d) != 1L) stop("AWC_DEPTH_PATH must be a single-layer depth raster.")
   wb_require_crs(d, "AWC depth")
-  a_d <- project(a, d)
+  a_d <- project(terra::buffer(a, 500), d)
   dc <- mask(crop(d, a_d, snap = "out"), a_d)
   z <- global(dc, c("min", "max", "mean"), na.rm = TRUE)
   cat("AWC depth raster (", cfg$awc_depth_units, "): min ", round(z[1,"min"], 1), " max ", round(z[1,"max"], 1), " mean ", round(z[1,"mean"], 1), "\n", sep = "")
@@ -1806,7 +1806,7 @@ wb_prepare_site_uncached <- function(cfg, job) {
   } else {
     awc <- wb_step("Opening AWC", cfg$awc_path, rast(cfg$awc_path))
     wb_require_crs(awc, "AWC")
-    a_awc <- project(a, awc)
+    a_awc <- project(terra::buffer(a, 500), awc)
     ac <- mask(crop(awc, a_awc, snap = "out"), a_awc)
     scale <- wb_check_awc(awc, ac, cfg)
     soil <- project(ac, dem, method = cfg$awc_resample)   # v6.3: "near" keeps map-unit edges sharp
